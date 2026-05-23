@@ -4,4 +4,8 @@
     <color name="top_bar_stroke">#FF263C44</color>
     <color name="divider_shadow">#99000000</color>
     <color name="divider_highlight">#22FFFFFF</color>
+    <color name="message_assistant_background">#FF1D3037</color>
+    <color name="message_assistant_text">#FFEAF4F6</color>
+    <color name="message_user_background">#FF1F4F7A</color>
+    <color name="message_user_text">#FFEAF7FF</color>
 </resources>

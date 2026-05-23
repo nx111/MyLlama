@@ -12,4 +12,8 @@
     <color name="top_bar_stroke">#FFD0E1E5</color>
     <color name="divider_shadow">#3381939A</color>
     <color name="divider_highlight">#99FFFFFF</color>
+    <color name="message_assistant_background">#FFE8EEF0</color>
+    <color name="message_assistant_text">#FF17262B</color>
+    <color name="message_user_background">#FF2563EB</color>
+    <color name="message_user_text">#FFFFFFFF</color>
 </resources>
