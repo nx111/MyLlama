@@ -1,10 +1,19 @@
-package com.example.llama
+package com.nx111.llama
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.ActivityNotFoundException
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.DocumentsContract
+import android.provider.Settings
 import android.text.InputType
 import android.view.View
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -17,6 +26,7 @@ import androidx.activity.addCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -49,10 +59,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var useScreen: View
     private lateinit var modelStatusTv: TextView
     private lateinit var conversationModeTv: TextView
+    private lateinit var addModelTabBtn: MaterialButton
+    private lateinit var modelListTabBtn: MaterialButton
+    private lateinit var addModelSection: View
+    private lateinit var installedModelSection: View
+    private lateinit var modelSourceSpinner: Spinner
+    private lateinit var huggingFaceSection: View
+    private lateinit var localModelSection: View
+    private lateinit var openAiModelSection: View
     private lateinit var hfSearchEt: EditText
+    private lateinit var installedModelsRv: RecyclerView
     private lateinit var hotModelsBtn: MaterialButton
     private lateinit var latestModelsBtn: MaterialButton
     private lateinit var searchModelBtn: MaterialButton
+    private lateinit var hfPrevPageBtn: MaterialButton
+    private lateinit var hfNextPageBtn: MaterialButton
+    private lateinit var hfPageStatusTv: TextView
     private lateinit var importBtn: MaterialButton
     private lateinit var configureOpenAiModelBtn: MaterialButton
     private lateinit var progressBar: ProgressBar
@@ -72,16 +94,55 @@ class MainActivity : AppCompatActivity() {
     private var currentModelLabel: String? = null
     private var currentAgentMode = AgentMode.CHAT
     private var didLoadHubModels = false
+    private var didTryAutoLoadLocalModel = false
+    private var hubPage = 1
+    private var hubSort = HuggingFaceSort.HOT
+    private var hubQuery: String? = null
+    private var hubHasNextPage = false
+    private var pendingPublicStorageSelection = false
 
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
     private val messageAdapter = MessageAdapter(messages)
+    private val installedModelAdapter = InstalledModelAdapter(
+        onClick = { model -> loadInstalledModel(model) },
+        onLongClick = { model -> showInstalledModelActions(model) }
+    )
     private val hubModelAdapter = HuggingFaceModelAdapter { model -> showQuantizationPicker(model) }
 
     private val pickModel = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) importModel(uri)
+    }
+
+    private val publicStoragePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        if (pendingPublicStorageSelection && hasPublicStoragePermission()) {
+            openPublicModelDirectoryPicker()
+        } else {
+            pendingPublicStorageSelection = false
+            Toast.makeText(this, "需要外部存储读写权限", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val allFilesAccessLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (pendingPublicStorageSelection && hasPublicStoragePermission()) {
+            openPublicModelDirectoryPicker()
+        } else {
+            pendingPublicStorageSelection = false
+            Toast.makeText(this, "需要所有文件访问权限", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val pickPublicModelDir = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        pendingPublicStorageSelection = false
+        if (uri != null) usePublicModelDirectory(uri)
     }
 
     private val backupLauncher = registerForActivityResult(
@@ -112,11 +173,14 @@ class MainActivity : AppCompatActivity() {
         appSettings = loadAppSettings()
         if (appSettings.modelProvider == ModelProvider.OPENAI_COMPATIBLE && appSettings.openAiModel.isNotBlank()) {
             currentModelLabel = "OpenAI兼容: ${appSettings.openAiModel}"
+        } else if (appSettings.localModelPath.isNotBlank()) {
+            currentModelLabel = File(appSettings.localModelPath).nameWithoutExtension
         }
         currentAgentMode = appSettings.agentMode
         bindViews()
         setupLists()
         loadMessages()
+        refreshInstalledModels()
         wireActions()
         updateConversationMode()
         showScreen(Screen.USE)
@@ -138,10 +202,22 @@ class MainActivity : AppCompatActivity() {
         useScreen = findViewById(R.id.use_screen)
         modelStatusTv = findViewById(R.id.model_status)
         conversationModeTv = findViewById(R.id.conversation_mode)
+        addModelTabBtn = findViewById(R.id.add_model_tab)
+        modelListTabBtn = findViewById(R.id.model_list_tab)
+        addModelSection = findViewById(R.id.add_model_section)
+        installedModelSection = findViewById(R.id.installed_model_section)
+        modelSourceSpinner = findViewById(R.id.model_source_spinner)
+        huggingFaceSection = findViewById(R.id.hugging_face_section)
+        localModelSection = findViewById(R.id.local_model_section)
+        openAiModelSection = findViewById(R.id.openai_model_section)
         hfSearchEt = findViewById(R.id.hf_search)
+        installedModelsRv = findViewById(R.id.installed_models)
         hotModelsBtn = findViewById(R.id.load_hot_models)
         latestModelsBtn = findViewById(R.id.load_latest_models)
         searchModelBtn = findViewById(R.id.search_model)
+        hfPrevPageBtn = findViewById(R.id.hf_prev_page)
+        hfNextPageBtn = findViewById(R.id.hf_next_page)
+        hfPageStatusTv = findViewById(R.id.hf_page_status)
         importBtn = findViewById(R.id.import_model)
         configureOpenAiModelBtn = findViewById(R.id.configure_openai_model)
         progressBar = findViewById(R.id.download_progress)
@@ -153,30 +229,62 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupLists() {
+        installedModelsRv.layoutManager = LinearLayoutManager(this)
+        installedModelsRv.adapter = installedModelAdapter
+
         hubModelsRv.layoutManager = LinearLayoutManager(this)
         hubModelsRv.adapter = hubModelAdapter
 
         messagesRv.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
         messagesRv.adapter = messageAdapter
+
+        modelSourceSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            AddModelSource.values().map { it.label }
+        ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
     }
 
     private fun wireActions() {
         settingsBtn.setOnClickListener { showSettingsDialog() }
         newChatBtn.setOnClickListener { startConversation(currentAgentMode) }
+        modelStatusTv.setOnClickListener { showCurrentModelPicker() }
         conversationPlusBtn.setOnClickListener { showConversationMenu() }
-        hotModelsBtn.setOnClickListener { loadHubModels(HuggingFaceSort.HOT, null) }
-        latestModelsBtn.setOnClickListener { loadHubModels(HuggingFaceSort.LATEST, null) }
+        addModelTabBtn.setOnClickListener { showInstallPanel(InstallPanel.ADD_MODEL) }
+        modelListTabBtn.setOnClickListener { showInstallPanel(InstallPanel.MODEL_LIST) }
+        hotModelsBtn.setOnClickListener { resetAndLoadHubModels(HuggingFaceSort.HOT, null) }
+        latestModelsBtn.setOnClickListener { resetAndLoadHubModels(HuggingFaceSort.LATEST, null) }
+        hfPrevPageBtn.setOnClickListener {
+            if (hubPage > 1) {
+                hubPage -= 1
+                loadHubModels()
+            }
+        }
+        hfNextPageBtn.setOnClickListener {
+            if (hubHasNextPage) {
+                hubPage += 1
+                loadHubModels()
+            }
+        }
         configureOpenAiModelBtn.setOnClickListener { showOpenAiModelDialog() }
         searchModelBtn.setOnClickListener {
             val query = hfSearchEt.text.toString().trim()
             if (query.isBlank()) {
                 Toast.makeText(this, "请输入搜索关键词", Toast.LENGTH_SHORT).show()
             } else {
-                loadHubModels(HuggingFaceSort.SEARCH, query)
+                resetAndLoadHubModels(HuggingFaceSort.SEARCH, query)
             }
         }
         importBtn.setOnClickListener { pickModel.launch(arrayOf("*/*")) }
         userActionFab.setOnClickListener { handleUserInput() }
+        modelSourceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val source = AddModelSource.values()[position.coerceIn(0, AddModelSource.values().lastIndex)]
+                updateAddModelSource(source)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
     }
 
     private fun showScreen(screen: Screen) {
@@ -227,27 +335,253 @@ class MainActivity : AppCompatActivity() {
 
     private fun showInstallScreen() {
         showScreen(Screen.INSTALL)
+        showInstallPanel(InstallPanel.ADD_MODEL)
+        refreshInstalledModels()
+        modelSourceSpinner.setSelection(AddModelSource.HUGGING_FACE.ordinal)
+        updateAddModelSource(AddModelSource.HUGGING_FACE)
         loadHubModelsOnce()
     }
+
+    private fun showInstallPanel(panel: InstallPanel) {
+        val showAddModel = panel == InstallPanel.ADD_MODEL
+        addModelSection.visibility = if (showAddModel) View.VISIBLE else View.GONE
+        installedModelSection.visibility = if (showAddModel) View.GONE else View.VISIBLE
+        addModelTabBtn.isChecked = showAddModel
+        modelListTabBtn.isChecked = !showAddModel
+        if (!showAddModel) refreshInstalledModels()
+    }
+
+    private fun updateAddModelSource(source: AddModelSource) {
+        huggingFaceSection.visibility = if (source == AddModelSource.HUGGING_FACE) View.VISIBLE else View.GONE
+        localModelSection.visibility = if (source == AddModelSource.LOCAL_GGUF) View.VISIBLE else View.GONE
+        openAiModelSection.visibility = if (source == AddModelSource.OPENAI_COMPATIBLE) View.VISIBLE else View.GONE
+        if (source == AddModelSource.HUGGING_FACE) loadHubModelsOnce()
+    }
+
+    private fun refreshInstalledModels() {
+        lifecycleScope.launch {
+            val models = modelRepository.listInstalledModels(installedModelDirs())
+            installedModelAdapter.submitList(models)
+        }
+    }
+
+    private fun loadInstalledModel(model: InstalledModel) {
+        if (isBusy) return
+        lifecycleScope.launch {
+            runCatching {
+                setBusy(true, "正在加载已安装模型...")
+                loadModel(model.file, persist = true)
+            }.onFailure { showError(it) }
+            refreshControls()
+        }
+    }
+
+    private fun showCurrentModelPicker() {
+        if (isBusy) return
+        lifecycleScope.launch {
+            runCatching {
+                val models = modelRepository.listInstalledModels(installedModelDirs())
+                if (models.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "没有已安装模型", Toast.LENGTH_SHORT).show()
+                } else {
+                    showModelPicker(models, "选择模型")
+                }
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun showInstalledModelActions(model: InstalledModel) {
+        if (isBusy) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(model.name)
+            .setItems(arrayOf("卸载", "删除", "迁移到当前模型目录")) { _, index ->
+                when (index) {
+                    0 -> unloadInstalledModel(model)
+                    1 -> confirmDeleteInstalledModel(model)
+                    2 -> migrateInstalledModel(model)
+                }
+            }
+            .show()
+    }
+
+    private fun unloadInstalledModel(model: InstalledModel) {
+        if (!isCurrentLocalModel(model.file)) {
+            Toast.makeText(this, "该模型当前未加载", Toast.LENGTH_SHORT).show()
+            return
+        }
+        lifecycleScope.launch {
+            runCatching {
+                engine?.cleanUp()
+                isModelReady = false
+                currentModelLabel = null
+                appSettings = appSettings.copy(localModelPath = "")
+                saveAppSettings()
+            }.onSuccess {
+                modelStatusTv.text = statusLine(engine)
+                Toast.makeText(this@MainActivity, "模型已卸载", Toast.LENGTH_SHORT).show()
+                refreshControls()
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun confirmDeleteInstalledModel(model: InstalledModel) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("删除模型")
+            .setMessage("确定删除 ${model.file.name}？")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除") { _, _ -> deleteInstalledModel(model) }
+            .show()
+    }
+
+    private fun deleteInstalledModel(model: InstalledModel) {
+        lifecycleScope.launch {
+            runCatching {
+                setBusy(true, "正在删除模型...")
+                if (isCurrentLocalModel(model.file)) {
+                    engine?.cleanUp()
+                    isModelReady = false
+                    currentModelLabel = null
+                    appSettings = appSettings.copy(localModelPath = "")
+                }
+                modelRepository.deleteInstalledModel(model.file)
+                saveAppSettings()
+                refreshInstalledModels()
+            }.onSuccess {
+                setBusy(false, statusLine(engine))
+                Toast.makeText(this@MainActivity, "模型已删除", Toast.LENGTH_SHORT).show()
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun migrateInstalledModel(model: InstalledModel) {
+        lifecycleScope.launch {
+            runCatching {
+                setBusy(true, "正在迁移模型...")
+                val target = modelRepository.migrateInstalledModel(model.file, modelStorageDir())
+                if (isCurrentLocalModel(model.file)) {
+                    appSettings = appSettings.copy(localModelPath = target.absolutePath)
+                    saveAppSettings()
+                }
+                refreshInstalledModels()
+                target
+            }.onSuccess {
+                setBusy(false, statusLine(engine))
+                Toast.makeText(this@MainActivity, "模型已迁移", Toast.LENGTH_SHORT).show()
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun isCurrentLocalModel(file: File): Boolean =
+        appSettings.modelProvider == ModelProvider.LOCAL &&
+            appSettings.localModelPath.isNotBlank() &&
+            File(appSettings.localModelPath).safeCanonicalPath() == file.safeCanonicalPath()
 
     private fun loadHubModelsOnce() {
         if (didLoadHubModels || isBusy || engine == null) return
         didLoadHubModels = true
-        loadHubModels(HuggingFaceSort.HOT, null)
+        resetAndLoadHubModels(HuggingFaceSort.HOT, null)
     }
 
-    private fun loadHubModels(sort: HuggingFaceSort, query: String?) {
+    private fun autoLoadLocalModelOnce() {
+        if (didTryAutoLoadLocalModel) return
+        if (appSettings.modelProvider != ModelProvider.LOCAL) return
+
+        didTryAutoLoadLocalModel = true
         lifecycleScope.launch {
             runCatching {
-                setBusy(true, if (query == null) "正在加载 Hugging Face 模型..." else "正在搜索 Hugging Face...")
+                val savedFile = savedLocalModelFile()
+                val savedModel = savedFile?.takeIf { it.isFile && it.canRead() }
+                if (savedModel != null) {
+                    setBusy(true, "正在加载上次使用的模型...")
+                    loadModel(savedModel, persist = true)
+                    return@runCatching
+                }
+
+                if (savedFile != null) {
+                    currentModelLabel = null
+                    appSettings = appSettings.copy(localModelPath = "")
+                    saveAppSettings()
+                }
+
+                val installedModels = modelRepository.listInstalledModels(installedModelDirs())
+                when (installedModels.size) {
+                    0 -> {
+                        modelStatusTv.text = if (savedFile == null) "未加载模型" else "上次使用的模型不存在，请添加模型"
+                        refreshControls()
+                    }
+                    1 -> {
+                        setBusy(true, if (savedFile == null) "正在加载模型..." else "上次使用的模型不存在，正在加载可用模型...")
+                        loadModel(installedModels.first().file, persist = true)
+                    }
+                    else -> {
+                        val pickerTitle = if (savedFile == null) "选择模型" else "上次使用的模型不存在"
+                        modelStatusTv.text = pickerTitle
+                        refreshControls()
+                        showModelPicker(installedModels, pickerTitle)
+                    }
+                }
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun showModelPicker(models: List<InstalledModel>, title: String) {
+        val items = models.map { model ->
+            "${model.name}  ${model.sizeLabel}"
+        }.toTypedArray()
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(title)
+            .setItems(items) { _, index ->
+                lifecycleScope.launch {
+                    runCatching {
+                        setBusy(true, "正在加载选择的模型...")
+                        loadModel(models[index].file, persist = true)
+                    }.onFailure { showError(it) }
+                    refreshControls()
+                }
+            }
+            .show()
+    }
+
+    private fun savedLocalModelFile(): File? =
+        appSettings.localModelPath
+            .takeIf { it.isNotBlank() }
+            ?.let { File(it) }
+
+    private fun modelStorageDir(): File =
+        modelRepository.modelsDir(appSettings.modelStoragePath)
+
+    private fun installedModelDirs(): List<File> =
+        buildList {
+            add(modelStorageDir())
+            add(modelRepository.defaultModelsDir)
+            modelRepository.externalModelsDir?.let { add(it) }
+        }.distinctBy { it.safeCanonicalPath() }
+
+    private fun resetAndLoadHubModels(sort: HuggingFaceSort, query: String?) {
+        hubSort = sort
+        hubQuery = query
+        hubPage = 1
+        loadHubModels()
+    }
+
+    private fun loadHubModels() {
+        lifecycleScope.launch {
+            runCatching {
+                setBusy(true, if (hubQuery == null) "正在加载 Hugging Face 模型..." else "正在搜索 Hugging Face...")
                 val models = modelRepository.listHuggingFaceModels(
-                    query = query,
-                    sort = sort,
+                    query = hubQuery,
+                    sort = hubSort,
                     baseUrl = appSettings.huggingFaceBaseUrl,
-                    token = appSettings.huggingFaceToken.ifBlank { null }
+                    token = appSettings.huggingFaceToken.ifBlank { null },
+                    limit = HUGGING_FACE_PAGE_SIZE + 1,
+                    page = hubPage
                 )
-                hubModelAdapter.submitList(models)
-                setBusy(false, if (models.isEmpty()) "没有找到可直接下载的 GGUF 模型" else statusLine(engine))
+                hubHasNextPage = models.size > HUGGING_FACE_PAGE_SIZE
+                val pageModels = models.take(HUGGING_FACE_PAGE_SIZE)
+                hubModelAdapter.submitList(pageModels)
+                updateHubPager()
+                setBusy(false, if (pageModels.isEmpty()) "没有找到可直接下载的 GGUF 模型" else statusLine(engine))
             }.onFailure {
                 didLoadHubModels = false
                 showError(it)
@@ -256,12 +590,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateHubPager() {
+        hfPageStatusTv.text = "第 $hubPage 页"
+        hfPrevPageBtn.isEnabled = !isBusy && hubPage > 1
+        hfNextPageBtn.isEnabled = !isBusy && hubHasNextPage
+    }
+
     private fun importModel(uri: Uri) {
         lifecycleScope.launch {
             runCatching {
                 setBusy(true, "正在导入本地 GGUF...")
-                val file = modelRepository.importModel(uri)
-                loadModel(file)
+                val file = modelRepository.importModel(uri, targetDir = modelStorageDir())
+                loadModel(file, persist = true)
+                refreshInstalledModels()
             }.onFailure { showError(it) }
             refreshControls()
         }
@@ -270,7 +611,7 @@ class MainActivity : AppCompatActivity() {
     private fun showQuantizationPicker(model: HuggingFaceModel) {
         if (isBusy) return
         val items = model.files.map { file ->
-            "${file.quantization}  ${file.sizeLabel}  ${file.filename.substringAfterLast('/')}"
+            "${file.quantization}  ${file.sizeLabel}"
         }.toTypedArray()
 
         MaterialAlertDialogBuilder(this)
@@ -293,6 +634,7 @@ class MainActivity : AppCompatActivity() {
                     repo = model.repoId,
                     filename = selectedFile.filename,
                     baseUrl = appSettings.huggingFaceBaseUrl,
+                    targetDir = modelStorageDir(),
                     token = appSettings.huggingFaceToken.ifBlank { null }
                 ) { progress ->
                     withContext(Dispatchers.Main) {
@@ -300,14 +642,15 @@ class MainActivity : AppCompatActivity() {
                         modelStatusTv.text = "下载中... $progress%\n${selectedFile.filename}"
                     }
                 }
-                loadModel(file)
+                loadModel(file, persist = true)
+                refreshInstalledModels()
             }.onFailure { showError(it) }
             progressBar.visibility = View.GONE
             refreshControls()
         }
     }
 
-    private suspend fun loadModel(modelFile: File) {
+    private suspend fun loadModel(modelFile: File, persist: Boolean) {
         val activeEngine = engine ?: error("Engine is not ready")
         if (isModelReady) {
             activeEngine.cleanUp()
@@ -327,11 +670,18 @@ class MainActivity : AppCompatActivity() {
             threads = appSettings.threads
         )
         activeEngine.loadModel(modelFile.path, options)
-        appSettings = appSettings.copy(modelProvider = ModelProvider.LOCAL)
+        if (persist) {
+            appSettings = appSettings.copy(
+                modelProvider = ModelProvider.LOCAL,
+                localModelPath = modelFile.absolutePath
+            )
+        }
         isModelReady = true
+        isBusy = false
         saveAppSettings()
         modelStatusTv.text = statusLine(activeEngine)
         showScreen(Screen.USE)
+        refreshControls()
     }
 
     private fun handleUserInput() {
@@ -467,14 +817,155 @@ class MainActivity : AppCompatActivity() {
     private fun showSettingsDialog() {
         MaterialAlertDialogBuilder(this)
             .setTitle("设置")
-            .setItems(arrayOf("模型参数", "HuggingFace 设置", "备份与恢复")) { _, index ->
+            .setItems(arrayOf("模型参数", "模型存储目录", "HuggingFace 设置", "备份与恢复")) { _, index ->
                 when (index) {
                     0 -> showModelParamsDialog()
-                    1 -> showHuggingFaceSettingsDialog()
-                    2 -> showBackupRestoreDialog()
+                    1 -> showModelStorageDialog()
+                    2 -> showHuggingFaceSettingsDialog()
+                    3 -> showBackupRestoreDialog()
                 }
             }
             .show()
+    }
+
+    private fun showModelStorageDialog() {
+        val options = buildList {
+            add(ModelStorageOption("内部存储\n${modelRepository.defaultModelsDir.absolutePath}", modelRepository.defaultModelsDir.absolutePath))
+            modelRepository.externalModelsDir?.let { dir ->
+                add(ModelStorageOption("外部应用目录\n${dir.absolutePath}", dir.absolutePath))
+            }
+            val currentPath = modelStorageDir().absolutePath
+            val isKnownAppPath = any { option -> option.path == currentPath }
+            val publicLabel = if (isKnownAppPath) "外部公共目录\n选择目录" else "外部公共目录\n$currentPath"
+            add(ModelStorageOption(publicLabel, null, usesPublicPicker = true))
+        }
+        val currentPath = modelStorageDir().absolutePath
+        val selectedIndex = options.indexOfFirst { option ->
+            option.path == currentPath || (option.usesPublicPicker && options.none { it.path == currentPath })
+        }.coerceAtLeast(0)
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("模型存储目录")
+            .setSingleChoiceItems(options.map { it.label }.toTypedArray(), selectedIndex) { dialog, index ->
+                val option = options[index]
+                dialog.dismiss()
+                if (option.usesPublicPicker) {
+                    requestPublicModelDirectorySelection()
+                } else {
+                    changeModelStorage(option.path.orEmpty())
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun requestPublicModelDirectorySelection() {
+        pendingPublicStorageSelection = true
+        if (hasPublicStoragePermission()) {
+            openPublicModelDirectoryPicker()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val appSettingsIntent = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            try {
+                allFilesAccessLauncher.launch(appSettingsIntent)
+            } catch (_: ActivityNotFoundException) {
+                allFilesAccessLauncher.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+        } else {
+            publicStoragePermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                )
+            )
+        }
+    }
+
+    private fun hasPublicStoragePermission(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun openPublicModelDirectoryPicker() {
+        pickPublicModelDir.launch(null)
+    }
+
+    private fun usePublicModelDirectory(uri: Uri) {
+        rememberPublicDirectoryAccess(uri)
+        val dir = publicDirectoryFromTreeUri(uri)
+        if (dir == null) {
+            Toast.makeText(this, "无法解析所选公共目录路径", Toast.LENGTH_LONG).show()
+            return
+        }
+        changeModelStorage(dir.absolutePath)
+    }
+
+    private fun rememberPublicDirectoryAccess(uri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        }
+    }
+
+    private fun publicDirectoryFromTreeUri(uri: Uri): File? {
+        if (!DocumentsContract.isTreeUri(uri)) return null
+        val documentId = DocumentsContract.getTreeDocumentId(uri)
+        val parts = documentId.split(":", limit = 2)
+        val volume = parts.getOrNull(0).orEmpty()
+        val relativePath = parts.getOrNull(1).orEmpty()
+        val root = when {
+            volume.equals("primary", ignoreCase = true) -> Environment.getExternalStorageDirectory()
+            volume.equals("home", ignoreCase = true) -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+            volume.isNotBlank() -> File("/storage/$volume")
+            else -> return null
+        }
+        return if (relativePath.isBlank()) root else File(root, relativePath)
+    }
+
+    private fun changeModelStorage(selectedPath: String) {
+        val oldDir = modelStorageDir()
+        val newDir = modelRepository.modelsDir(selectedPath)
+        if (oldDir.absolutePath == newDir.absolutePath) {
+            Toast.makeText(this, "模型存储目录未变化", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val oldLocalPath = appSettings.localModelPath
+
+        lifecycleScope.launch {
+            runCatching {
+                setBusy(true, "正在迁移已安装模型...")
+                val migratedModels = modelRepository.migrateInstalledModels(oldDir, newDir)
+                appSettings = appSettings.copy(
+                    modelStoragePath = newDir.absolutePath,
+                    localModelPath = updatedLocalModelPath(oldLocalPath, migratedModels)
+                )
+                didTryAutoLoadLocalModel = false
+                saveAppSettings()
+                refreshInstalledModels()
+                migratedModels.size
+            }.onSuccess { movedCount ->
+                setBusy(false, statusLine(engine))
+                Toast.makeText(this@MainActivity, "模型存储目录已切换，迁移 $movedCount 个模型", Toast.LENGTH_SHORT).show()
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun updatedLocalModelPath(oldLocalPath: String, migratedModels: Map<String, File>): String {
+        if (oldLocalPath.isBlank()) return ""
+        val oldLocalFile = File(oldLocalPath)
+        return migratedModels[oldLocalFile.absolutePath]?.absolutePath
+            ?: oldLocalPath.takeIf { oldLocalFile.isFile }
+            ?: ""
     }
 
     private fun showModelParamsDialog() {
@@ -622,9 +1113,11 @@ class MainActivity : AppCompatActivity() {
         val providerName = prefs.getString(KEY_MODEL_PROVIDER, ModelProvider.LOCAL.name)
         return AppSettings(
             modelProvider = ModelProvider.values().firstOrNull { it.name == providerName } ?: ModelProvider.LOCAL,
+            modelStoragePath = prefs.getString(KEY_MODEL_STORAGE_PATH, "").orEmpty(),
             huggingFaceBaseUrl = prefs.getString(KEY_HF_BASE_URL, DEFAULT_HUGGING_FACE_BASE_URL)
                 ?: DEFAULT_HUGGING_FACE_BASE_URL,
             huggingFaceToken = prefs.getString(KEY_HF_TOKEN, "").orEmpty(),
+            localModelPath = prefs.getString(KEY_LOCAL_MODEL_PATH, "").orEmpty(),
             openAiBaseUrl = prefs.getString(KEY_OPENAI_BASE_URL, DEFAULT_OPENAI_BASE_URL)
                 ?: DEFAULT_OPENAI_BASE_URL,
             openAiApiKey = prefs.getString(KEY_OPENAI_API_KEY, "").orEmpty(),
@@ -640,8 +1133,10 @@ class MainActivity : AppCompatActivity() {
     private fun saveAppSettings() {
         prefs().edit()
             .putString(KEY_MODEL_PROVIDER, appSettings.modelProvider.name)
+            .putString(KEY_MODEL_STORAGE_PATH, appSettings.modelStoragePath)
             .putString(KEY_HF_BASE_URL, appSettings.huggingFaceBaseUrl)
             .putString(KEY_HF_TOKEN, appSettings.huggingFaceToken)
+            .putString(KEY_LOCAL_MODEL_PATH, appSettings.localModelPath)
             .putString(KEY_OPENAI_BASE_URL, appSettings.openAiBaseUrl)
             .putString(KEY_OPENAI_API_KEY, appSettings.openAiApiKey)
             .putString(KEY_OPENAI_MODEL, appSettings.openAiModel)
@@ -686,10 +1181,12 @@ class MainActivity : AppCompatActivity() {
                 appSettings = AppSettings.fromJson(json.optJSONObject("settings") ?: JSONObject())
                 currentAgentMode = appSettings.agentMode
                 currentModelLabel =
-                    if (appSettings.modelProvider == ModelProvider.OPENAI_COMPATIBLE && appSettings.openAiModel.isNotBlank()) {
-                        "OpenAI兼容: ${appSettings.openAiModel}"
-                    } else {
-                        currentModelLabel
+                    when {
+                        appSettings.modelProvider == ModelProvider.OPENAI_COMPATIBLE && appSettings.openAiModel.isNotBlank() ->
+                            "OpenAI兼容: ${appSettings.openAiModel}"
+                        appSettings.localModelPath.isNotBlank() ->
+                            File(appSettings.localModelPath).nameWithoutExtension
+                        else -> currentModelLabel
                     }
 
                 messages.clear()
@@ -708,10 +1205,12 @@ class MainActivity : AppCompatActivity() {
                 saveAppSettings()
                 saveMessages()
                 didLoadHubModels = false
+                didTryAutoLoadLocalModel = false
                 hubModelAdapter.submitList(emptyList())
             }.onSuccess {
                 updateConversationMode()
                 messageAdapter.notifyDataSetChanged()
+                refreshInstalledModels()
                 showScreen(Screen.USE)
                 modelStatusTv.text = statusLine(engine)
                 Toast.makeText(this@MainActivity, "恢复完成", Toast.LENGTH_SHORT).show()
@@ -725,6 +1224,7 @@ class MainActivity : AppCompatActivity() {
             is InferenceEngine.State.Initialized -> {
                 isModelReady = false
                 setBusy(false, statusLine(engine))
+                autoLoadLocalModelOnce()
                 if (installScreen.visibility == View.VISIBLE) loadHubModelsOnce()
             }
             is InferenceEngine.State.ModelReady -> {
@@ -759,30 +1259,34 @@ class MainActivity : AppCompatActivity() {
     private fun refreshControls() {
         val engineReady = engine != null
         val canInstall = engineReady && !isBusy
-        val canPrompt = canInstall && activeModelReady()
         settingsBtn.isEnabled = !isBusy
         newChatBtn.isEnabled = !isBusy
+        modelStatusTv.isEnabled = !isBusy
         conversationPlusBtn.isEnabled = !isBusy
+        addModelTabBtn.isEnabled = canInstall
+        modelListTabBtn.isEnabled = canInstall
+        modelSourceSpinner.isEnabled = canInstall
         hotModelsBtn.isEnabled = canInstall
         latestModelsBtn.isEnabled = canInstall
         configureOpenAiModelBtn.isEnabled = canInstall
         searchModelBtn.isEnabled = canInstall
+        hfPrevPageBtn.isEnabled = canInstall && hubPage > 1
+        hfNextPageBtn.isEnabled = canInstall && hubHasNextPage
         importBtn.isEnabled = canInstall
         hfSearchEt.isEnabled = canInstall
         hubModelsRv.isEnabled = canInstall
-        userInputEt.isEnabled = canPrompt
-        userActionFab.isEnabled = canPrompt
+        installedModelsRv.isEnabled = canInstall
+        userInputEt.isEnabled = canInstall
+        userActionFab.isEnabled = canInstall
     }
 
-    private fun statusLine(activeEngine: InferenceEngine?): String {
+    private fun statusLine(_activeEngine: InferenceEngine?): String {
         if (appSettings.modelProvider == ModelProvider.OPENAI_COMPATIBLE) {
             val model = appSettings.openAiModel.ifBlank { "未配置" }
-            val endpoint = appSettings.openAiBaseUrl.ifBlank { DEFAULT_OPENAI_BASE_URL }
-            return "模型: OpenAI兼容 / $model\n后端: $endpoint"
+            return "模型: OpenAI兼容 / $model"
         }
-        val backendInfo = runCatching { activeEngine?.availableBackends() }.getOrNull() ?: "CPU"
         val model = currentModelLabel ?: "未加载模型"
-        return "模型: $model\n后端: ${appSettings.backend.label} / $backendInfo"
+        return "模型: $model"
     }
 
     private fun showError(error: Throwable) {
@@ -807,14 +1311,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun Int.dp() = (this * resources.displayMetrics.density).toInt()
 
+    private fun File.safeCanonicalPath(): String =
+        runCatching { canonicalPath }.getOrDefault(absolutePath)
+
     private enum class Screen {
         INSTALL,
         USE
     }
 
+    private enum class InstallPanel {
+        ADD_MODEL,
+        MODEL_LIST
+    }
+
     private enum class ModelProvider {
         LOCAL,
         OPENAI_COMPATIBLE
+    }
+
+    private data class ModelStorageOption(
+        val label: String,
+        val path: String?,
+        val usesPublicPicker: Boolean = false
+    )
+
+    private enum class AddModelSource(val label: String) {
+        HUGGING_FACE("Hugging Face"),
+        LOCAL_GGUF("本地 GGUF"),
+        OPENAI_COMPATIBLE("OpenAI 兼容")
     }
 
     private enum class EngineChoice(val label: String, val backend: EngineBackend) {
@@ -844,8 +1368,10 @@ class MainActivity : AppCompatActivity() {
 
     private data class AppSettings(
         val modelProvider: ModelProvider = ModelProvider.LOCAL,
+        val modelStoragePath: String = "",
         val huggingFaceBaseUrl: String = DEFAULT_HUGGING_FACE_BASE_URL,
         val huggingFaceToken: String = "",
+        val localModelPath: String = "",
         val openAiBaseUrl: String = DEFAULT_OPENAI_BASE_URL,
         val openAiApiKey: String = "",
         val openAiModel: String = "",
@@ -857,8 +1383,10 @@ class MainActivity : AppCompatActivity() {
     ) {
         fun toJson() = JSONObject()
             .put(KEY_MODEL_PROVIDER, modelProvider.name)
+            .put(KEY_MODEL_STORAGE_PATH, modelStoragePath)
             .put(KEY_HF_BASE_URL, huggingFaceBaseUrl)
             .put(KEY_HF_TOKEN, huggingFaceToken)
+            .put(KEY_LOCAL_MODEL_PATH, localModelPath)
             .put(KEY_OPENAI_BASE_URL, openAiBaseUrl)
             .put(KEY_OPENAI_API_KEY, openAiApiKey)
             .put(KEY_OPENAI_MODEL, openAiModel)
@@ -875,9 +1403,11 @@ class MainActivity : AppCompatActivity() {
                 val providerName = json.optString(KEY_MODEL_PROVIDER, ModelProvider.LOCAL.name)
                 return AppSettings(
                     modelProvider = ModelProvider.values().firstOrNull { it.name == providerName } ?: ModelProvider.LOCAL,
+                    modelStoragePath = json.optString(KEY_MODEL_STORAGE_PATH),
                     huggingFaceBaseUrl = json.optString(KEY_HF_BASE_URL, DEFAULT_HUGGING_FACE_BASE_URL)
                         .ifBlank { DEFAULT_HUGGING_FACE_BASE_URL },
                     huggingFaceToken = json.optString(KEY_HF_TOKEN),
+                    localModelPath = json.optString(KEY_LOCAL_MODEL_PATH),
                     openAiBaseUrl = json.optString(KEY_OPENAI_BASE_URL, DEFAULT_OPENAI_BASE_URL)
                         .ifBlank { DEFAULT_OPENAI_BASE_URL },
                     openAiApiKey = json.optString(KEY_OPENAI_API_KEY),
@@ -895,13 +1425,16 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         private const val DEFAULT_CONTEXT_SIZE = 4096
         private const val DEFAULT_PREDICT_LENGTH = 1024
+        private const val HUGGING_FACE_PAGE_SIZE = 8
         private const val DEFAULT_HUGGING_FACE_BASE_URL = "https://huggingface.co"
         private const val DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
         private const val PREFS_NAME = "myllama_state"
         private const val KEY_MESSAGES = "messages"
         private const val KEY_MODEL_PROVIDER = "modelProvider"
+        private const val KEY_MODEL_STORAGE_PATH = "modelStoragePath"
         private const val KEY_HF_BASE_URL = "huggingFaceBaseUrl"
         private const val KEY_HF_TOKEN = "huggingFaceToken"
+        private const val KEY_LOCAL_MODEL_PATH = "localModelPath"
         private const val KEY_OPENAI_BASE_URL = "openAiBaseUrl"
         private const val KEY_OPENAI_API_KEY = "openAiApiKey"
         private const val KEY_OPENAI_MODEL = "openAiModel"

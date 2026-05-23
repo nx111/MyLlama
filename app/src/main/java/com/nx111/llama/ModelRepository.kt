@@ -1,4 +1,4 @@
-package com.example.llama
+package com.nx111.llama
 
 import android.content.ContentResolver
 import android.content.Context
@@ -17,14 +17,96 @@ class ModelRepository(private val context: Context) {
     private val contentResolver: ContentResolver = context.contentResolver
 
     val modelsDir: File
-        get() = File(context.filesDir, DIRECTORY_MODELS).also { dir ->
+        get() = defaultModelsDir
+
+    val defaultModelsDir: File
+        get() = File(context.filesDir, DIRECTORY_MODELS).ensureModelDirectory()
+
+    val externalModelsDir: File?
+        get() = context.getExternalFilesDir(null)?.let { File(it, DIRECTORY_MODELS).ensureModelDirectory() }
+
+    fun modelsDir(path: String?): File =
+        path?.takeIf { it.isNotBlank() }?.let { File(it).ensureModelDirectory() } ?: defaultModelsDir
+
+    suspend fun listInstalledModels(targetDir: File): List<InstalledModel> =
+        listInstalledModels(listOf(targetDir))
+
+    suspend fun listInstalledModels(targetDirs: List<File>): List<InstalledModel> = withContext(Dispatchers.IO) {
+        targetDirs
+            .distinctBy { it.safeCanonicalPath() }
+            .flatMap { dir ->
+                if (!dir.exists() || !dir.isDirectory) emptyList()
+                else dir.listFiles { file -> file.isFile && file.extension.equals("gguf", ignoreCase = true) }.orEmpty().toList()
+            }
+            .distinctBy { it.safeCanonicalPath() }
+            .sortedByDescending { it.lastModified() }
+            .map { InstalledModel(it) }
+    }
+
+    suspend fun migrateInstalledModels(fromDir: File, toDir: File): Map<String, File> = withContext(Dispatchers.IO) {
+        val sourceDir = fromDir.ensureModelDirectory()
+        val targetDir = toDir.ensureModelDirectory()
+        if (sourceDir.canonicalPath == targetDir.canonicalPath) return@withContext emptyMap()
+
+        sourceDir.listFiles { file -> file.isFile && file.extension.equals("gguf", ignoreCase = true) }
+            .orEmpty()
+            .associate { source ->
+                val target = targetDir.availableModelFile(source.name)
+                if (!source.renameTo(target)) {
+                    source.inputStream().use { input ->
+                        FileOutputStream(target).use { output -> input.copyTo(output) }
+                    }
+                    if (!source.delete()) error("Cannot remove migrated model: ${source.name}")
+                }
+                source.absolutePath to target
+            }
+    }
+
+    suspend fun migrateInstalledModel(modelFile: File, targetDir: File): File = withContext(Dispatchers.IO) {
+        require(modelFile.isFile) { "模型文件不存在" }
+        val targetDirectory = targetDir.ensureModelDirectory()
+        if (modelFile.parentFile?.safeCanonicalPath() == targetDirectory.safeCanonicalPath()) {
+            return@withContext modelFile
+        }
+
+        val target = targetDirectory.availableModelFile(modelFile.name)
+        if (!modelFile.renameTo(target)) {
+            modelFile.inputStream().use { input ->
+                FileOutputStream(target).use { output -> input.copyTo(output) }
+            }
+            if (!modelFile.delete()) error("Cannot remove migrated model: ${modelFile.name}")
+        }
+        target
+    }
+
+    suspend fun deleteInstalledModel(modelFile: File) = withContext(Dispatchers.IO) {
+        if (modelFile.exists() && !modelFile.delete()) error("无法删除模型文件")
+    }
+
+    private fun File.ensureModelDirectory(): File =
+        also { dir ->
             if (dir.exists() && !dir.isDirectory) dir.delete()
             if (!dir.exists()) dir.mkdirs()
         }
 
-    suspend fun importModel(uri: Uri): File = withContext(Dispatchers.IO) {
+    private fun File.safeCanonicalPath(): String =
+        runCatching { canonicalPath }.getOrDefault(absolutePath)
+
+    private fun File.availableModelFile(fileName: String): File {
+        val safeName = fileName.sanitizeFileName().ensureGgufExtension()
+        val base = safeName.substringBeforeLast('.', safeName)
+        var target = File(this, safeName)
+        var index = 2
+        while (target.exists()) {
+            target = File(this, "$base-$index.gguf")
+            index += 1
+        }
+        return target
+    }
+
+    suspend fun importModel(uri: Uri, targetDir: File = modelsDir): File = withContext(Dispatchers.IO) {
         val fileName = displayName(uri).sanitizeFileName().ensureGgufExtension()
-        val target = File(modelsDir, fileName)
+        val target = File(targetDir.ensureModelDirectory(), fileName)
         contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(target).use { output -> input.copyTo(output) }
         } ?: error("Cannot open selected file")
@@ -35,13 +117,14 @@ class ModelRepository(private val context: Context) {
         repo: String,
         filename: String,
         baseUrl: String,
+        targetDir: File = modelsDir,
         token: String?,
         onProgress: suspend (Int) -> Unit
     ): File = withContext(Dispatchers.IO) {
         require(repo.isNotBlank()) { "Hugging Face repo is required" }
         require(filename.isNotBlank()) { "GGUF filename is required" }
 
-        val target = File(modelsDir, filename.substringAfterLast('/').sanitizeFileName().ensureGgufExtension())
+        val target = File(targetDir.ensureModelDirectory(), filename.substringAfterLast('/').sanitizeFileName().ensureGgufExtension())
         val connection = URL(huggingFaceResolveUrl(baseUrl, repo, filename)).openConnection() as HttpURLConnection
         connection.instanceFollowRedirects = true
         connection.connectTimeout = 15_000
@@ -88,13 +171,16 @@ class ModelRepository(private val context: Context) {
         query: String?,
         sort: HuggingFaceSort,
         baseUrl: String,
-        token: String?
+        token: String?,
+        limit: Int,
+        page: Int
     ): List<HuggingFaceModel> = withContext(Dispatchers.IO) {
         val params = linkedMapOf(
             "filter" to "gguf",
             "sort" to sort.apiValue,
             "direction" to "-1",
-            "limit" to "50",
+            "limit" to limit.coerceAtLeast(1).toString(),
+            "skip" to ((page.coerceAtLeast(1) - 1) * limit.coerceAtLeast(1)).toString(),
             "full" to "true"
         )
         if (!query.isNullOrBlank()) {
@@ -153,7 +239,6 @@ class ModelRepository(private val context: Context) {
                             pipelineTag = model.optString("pipeline_tag")
                         )
                     )
-                    if (size >= MODEL_RESULT_LIMIT) break
                 }
             }
         } finally {
@@ -277,7 +362,6 @@ class ModelRepository(private val context: Context) {
     private companion object {
         private const val DIRECTORY_MODELS = "models"
         private const val DEFAULT_BUFFER_SIZE = 1024 * 1024
-        private const val MODEL_RESULT_LIMIT = 8
         private const val DEFAULT_HUGGING_FACE_BASE_URL = "https://huggingface.co"
         private const val UNKNOWN_SIZE_BYTES = -1L
 
@@ -351,5 +435,23 @@ data class HuggingFaceFile(
             sizeBytes >= 1024L -> "%.0f KB".format(sizeBytes.toDouble() / 1024.0)
             sizeBytes > 0 -> "$sizeBytes B"
             else -> "大小未知"
+        }
+}
+
+data class InstalledModel(
+    val file: File
+) {
+    val name: String
+        get() = file.nameWithoutExtension
+
+    val path: String
+        get() = file.absolutePath
+
+    val sizeLabel: String
+        get() = when (val bytes = file.length()) {
+            in 1024L * 1024L * 1024L..Long.MAX_VALUE -> "%.2f GB".format(bytes.toDouble() / 1024.0 / 1024.0 / 1024.0)
+            in 1024L * 1024L until 1024L * 1024L * 1024L -> "%.0f MB".format(bytes.toDouble() / 1024.0 / 1024.0)
+            in 1024L until 1024L * 1024L -> "%.0f KB".format(bytes.toDouble() / 1024.0)
+            else -> "$bytes B"
         }
 }

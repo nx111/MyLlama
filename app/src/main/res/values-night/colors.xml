@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="top_bar_background">#FF122329</color>
+    <color name="top_bar_stroke">#FF263C44</color>
+    <color name="divider_shadow">#99000000</color>
+    <color name="divider_highlight">#22FFFFFF</color>
+</resources>

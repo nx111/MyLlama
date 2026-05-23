@@ -1,4 +1,4 @@
-package com.example.llama
+package com.nx111.llama
 
 import android.view.LayoutInflater
 import android.view.View
@@ -39,7 +39,7 @@ class HuggingFaceModelAdapter(
 
         fun bind(model: HuggingFaceModel) {
             titleTv.text = model.repoId
-            fileTv.text = "点击选择量化版本 · ${model.files.size} 个版本 · 推荐 ${model.recommendedFile.quantization} · ${model.recommendedFile.sizeLabel}"
+            fileTv.text = "${model.files.size} 个版本 · 推荐 ${model.recommendedFile.quantization} · ${model.recommendedFile.sizeLabel}"
             metaTv.text = listOfNotNull(
                 "下载 ${model.downloads.compact()}",
                 "喜欢 ${model.likes.compact()}",

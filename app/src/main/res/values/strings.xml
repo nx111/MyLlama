@@ -5,6 +5,9 @@
     <string name="new_chat_symbol">+</string>
     <string name="circled_plus">⊕</string>
     <string name="add_model">添加模型</string>
+    <string name="model_list">模型列表</string>
+    <string name="installed_models">已安装模型</string>
+    <string name="select_model">选择模型</string>
     <string name="configure_openai_model">配置 OpenAI 兼容模型</string>
     <string name="hf_token_hint">访问令牌，可选</string>
     <string name="hf_mirror_hint">Hugging Face 镜像地址</string>
@@ -12,6 +15,8 @@
     <string name="search_model">搜索</string>
     <string name="hot_models">最热</string>
     <string name="latest_models">最新</string>
+    <string name="prev_page">上一页</string>
+    <string name="next_page">下一页</string>
     <string name="import_model">本地导入</string>
     <string name="user_input_hint">输入消息</string>
 </resources>

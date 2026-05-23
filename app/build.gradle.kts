@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.llama"
+    namespace = "com.nx111.llama"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.llama.myllama"
+        applicationId = "com.nx111.llama.myllama"
 
         minSdk = 24
         targetSdk = 36

@@ -1,4 +1,4 @@
-package com.example.llama
+package com.nx111.llama
 
 import android.view.LayoutInflater
 import android.view.View
