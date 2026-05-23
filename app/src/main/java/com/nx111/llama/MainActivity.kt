@@ -41,6 +41,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -100,6 +101,8 @@ class MainActivity : AppCompatActivity() {
     private var hubQuery: String? = null
     private var hubHasNextPage = false
     private var pendingPublicStorageSelection = false
+    private var assistantRenderJob: Job? = null
+    private var shouldAutoScrollAssistant = false
 
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
@@ -236,6 +239,7 @@ class MainActivity : AppCompatActivity() {
         hubModelsRv.adapter = hubModelAdapter
 
         messagesRv.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
+        messagesRv.itemAnimator = null
         messagesRv.adapter = messageAdapter
 
         modelSourceSpinner.adapter = ArrayAdapter(
@@ -699,10 +703,12 @@ class MainActivity : AppCompatActivity() {
         setBusy(true, "生成中...")
 
         val prompt = currentAgentMode.prompt(userMsg)
+        val firstInsertedIndex = messages.size
         messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
         lastAssistantMsg.clear()
         messages.add(Message(UUID.randomUUID().toString(), "", false))
-        messageAdapter.notifyDataSetChanged()
+        shouldAutoScrollAssistant = true
+        messageAdapter.notifyItemRangeInserted(firstInsertedIndex, 2)
         messagesRv.scrollToPosition(messages.lastIndex)
 
         val history = messages.dropLast(2)
@@ -719,8 +725,10 @@ class MainActivity : AppCompatActivity() {
                     )
                 }.onSuccess { reply ->
                     appendAssistantToken(reply)
+                    flushAssistantMessage()
                     saveMessages()
                 }.onFailure { error ->
+                    flushAssistantMessage()
                     showError(error)
                     saveMessages()
                 }
@@ -733,6 +741,7 @@ class MainActivity : AppCompatActivity() {
                     activeEngine.sendUserPrompt(prompt, appSettings.predictLength)
                         .onCompletion {
                             withContext(Dispatchers.Main) {
+                                flushAssistantMessage()
                                 saveMessages()
                                 refreshControls()
                             }
@@ -742,6 +751,7 @@ class MainActivity : AppCompatActivity() {
                         }
                 }.onFailure { error ->
                     withContext(Dispatchers.Main) {
+                        flushAssistantMessage()
                         showError(error)
                         saveMessages()
                         refreshControls()
@@ -806,13 +816,41 @@ class MainActivity : AppCompatActivity() {
 
     private fun appendAssistantToken(token: String) {
         if (messages.isEmpty() || messages.last().isUser) return
+        shouldAutoScrollAssistant = shouldAutoScrollAssistant || isMessagesAtBottom()
         val updated = messages.removeAt(messages.lastIndex).copy(
             content = lastAssistantMsg.append(token).toString()
         )
         messages.add(updated)
-        messageAdapter.notifyItemChanged(messages.lastIndex)
-        messagesRv.scrollToPosition(messages.lastIndex)
+        scheduleAssistantMessageRender()
     }
+
+    private fun scheduleAssistantMessageRender() {
+        if (assistantRenderJob?.isActive == true) return
+        assistantRenderJob = lifecycleScope.launch {
+            delay(ASSISTANT_RENDER_INTERVAL_MS)
+            assistantRenderJob = null
+            renderAssistantMessage()
+        }
+    }
+
+    private fun flushAssistantMessage() {
+        assistantRenderJob?.cancel()
+        assistantRenderJob = null
+        renderAssistantMessage()
+    }
+
+    private fun renderAssistantMessage() {
+        if (messages.isEmpty() || messages.last().isUser) return
+        val shouldScroll = shouldAutoScrollAssistant || isMessagesAtBottom()
+        shouldAutoScrollAssistant = false
+        messageAdapter.notifyItemChanged(messages.lastIndex, MESSAGE_CONTENT_PAYLOAD)
+        if (shouldScroll) {
+            messagesRv.post { messagesRv.scrollToPosition(messages.lastIndex) }
+        }
+    }
+
+    private fun isMessagesAtBottom(): Boolean =
+        !messagesRv.canScrollVertically(1)
 
     private fun showSettingsDialog() {
         MaterialAlertDialogBuilder(this)
@@ -1426,6 +1464,8 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_CONTEXT_SIZE = 4096
         private const val DEFAULT_PREDICT_LENGTH = 1024
         private const val HUGGING_FACE_PAGE_SIZE = 8
+        private const val ASSISTANT_RENDER_INTERVAL_MS = 60L
+        private const val MESSAGE_CONTENT_PAYLOAD = "message_content"
         private const val DEFAULT_HUGGING_FACE_BASE_URL = "https://huggingface.co"
         private const val DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
         private const val PREFS_NAME = "myllama_state"

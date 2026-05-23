@@ -16,6 +16,10 @@ class MessageAdapter(
     private val messages: List<Message>
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
+    init {
+        setHasStableIds(true)
+    }
+
     companion object {
         private const val VIEW_TYPE_USER = 1
         private const val VIEW_TYPE_ASSISTANT = 2
@@ -37,7 +41,21 @@ class MessageAdapter(
     }
 
     override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-        val message = messages[position]
+        bindContent(holder, messages[position])
+    }
+
+    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int, payloads: MutableList<Any>) {
+        if (payloads.isNotEmpty()) {
+            bindContent(holder, messages[position])
+        } else {
+            super.onBindViewHolder(holder, position, payloads)
+        }
+    }
+
+    override fun getItemId(position: Int): Long =
+        messages[position].id.hashCode().toLong()
+
+    private fun bindContent(holder: RecyclerView.ViewHolder, message: Message) {
         if (holder is UserMessageViewHolder || holder is AssistantMessageViewHolder) {
             val textView = holder.itemView.findViewById<TextView>(R.id.msg_content)
             textView.text = message.content
