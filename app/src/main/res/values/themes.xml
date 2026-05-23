@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Base.Theme.MyLlama" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#2563EB</item>
+        <item name="colorSecondary">#0F766E</item>
+    </style>
+
+    <style name="Theme.MyLlama" parent="Base.Theme.MyLlama" />
+</resources>
