@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
@@ -126,6 +127,12 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) importModel(uri)
+    }
+
+    private val pickAttachment = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) attachFileToInput(uri)
     }
 
     private val publicStoragePermissionLauncher = registerForActivityResult(
@@ -260,9 +267,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun wireActions() {
         settingsBtn.setOnClickListener { showAppMenu() }
-        newChatBtn.setOnClickListener { startConversation(currentAgentMode) }
+        newChatBtn.setOnClickListener { showConversationMenu(newChatBtn) }
         modelStatusTv.setOnClickListener { showCurrentModelPicker() }
-        conversationPlusBtn.setOnClickListener { showConversationMenu() }
+        conversationPlusBtn.setOnClickListener { showAttachmentMenu() }
         addModelTabBtn.setOnClickListener { showInstallPanel(InstallPanel.ADD_MODEL) }
         modelListTabBtn.setOnClickListener { showInstallPanel(InstallPanel.MODEL_LIST) }
         hotModelsBtn.setOnClickListener { resetAndLoadHubModels(HuggingFaceSort.HOT, null) }
@@ -306,8 +313,8 @@ class MainActivity : AppCompatActivity() {
         useScreen.visibility = if (installing) View.GONE else View.VISIBLE
     }
 
-    private fun showConversationMenu() {
-        PopupMenu(this, conversationPlusBtn).apply {
+    private fun showConversationMenu(anchor: View) {
+        PopupMenu(this, anchor).apply {
             menu.add(0, MENU_CHAT, 0, "新建聊天")
             menu.add(0, MENU_WRITING, 1, "新建写作")
             menu.add(0, MENU_TRANSLATION, 2, "新建翻译")
@@ -322,6 +329,23 @@ class MainActivity : AppCompatActivity() {
                     MENU_IMAGE_PROMPT -> startConversation(AgentMode.IMAGE_PROMPT)
                     MENU_ADD_MODEL -> showInstallScreen()
                     MENU_OPENAI_MODEL -> showOpenAiModelDialog()
+                }
+                true
+            }
+            show()
+        }
+    }
+
+    private fun showAttachmentMenu() {
+        PopupMenu(this, conversationPlusBtn).apply {
+            menu.add(0, MENU_ATTACH_TEXT, 0, "添加文本文件")
+            menu.add(0, MENU_ATTACH_IMAGE, 1, "添加图片")
+            menu.add(0, MENU_ATTACH_FILE, 2, "添加文件")
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    MENU_ATTACH_TEXT -> pickAttachment.launch(arrayOf("text/*"))
+                    MENU_ATTACH_IMAGE -> pickAttachment.launch(arrayOf("image/*"))
+                    MENU_ATTACH_FILE -> pickAttachment.launch(arrayOf("*/*"))
                 }
                 true
             }
@@ -469,6 +493,70 @@ class MainActivity : AppCompatActivity() {
     private fun updateConversationMode() {
         conversationModeTv.text = currentAgentMode.label
     }
+
+    private fun attachFileToInput(uri: Uri) {
+        lifecycleScope.launch {
+            runCatching {
+                val name = attachmentName(uri)
+                val mimeType = contentResolver.getType(uri).orEmpty()
+                val attachmentText = if (isTextAttachment(name, mimeType)) {
+                    val body = withContext(Dispatchers.IO) { readTextAttachment(uri) }
+                    val truncated = body.length >= MAX_ATTACHMENT_TEXT_CHARS
+                    buildString {
+                        append("[附件: ")
+                        append(name)
+                        append("]\n")
+                        append(body)
+                        if (truncated) append("\n[附件内容已截断]")
+                        append("\n[/附件]")
+                    }
+                } else {
+                    "[附件: $name${mimeType.takeIf { it.isNotBlank() }?.let { ", 类型: $it" }.orEmpty()}]"
+                }
+                appendToInput(attachmentText)
+                name
+            }.onSuccess { name ->
+                Toast.makeText(this@MainActivity, "已添加附件: $name", Toast.LENGTH_SHORT).show()
+            }.onFailure { showError(it) }
+        }
+    }
+
+    private fun appendToInput(text: String) {
+        val current = userInputEt.text?.toString().orEmpty()
+        val separator = if (current.isBlank()) "" else "\n\n"
+        userInputEt.setText(current + separator + text)
+        userInputEt.setSelection(userInputEt.text?.length ?: 0)
+    }
+
+    private fun attachmentName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) return cursor.getString(index)
+            }
+        }
+        return uri.lastPathSegment ?: "附件"
+    }
+
+    private fun isTextAttachment(name: String, mimeType: String): Boolean {
+        if (mimeType.startsWith("text/")) return true
+        val lowerName = name.lowercase()
+        return TEXT_ATTACHMENT_EXTENSIONS.any { lowerName.endsWith(it) }
+    }
+
+    private fun readTextAttachment(uri: Uri): String =
+        contentResolver.openInputStream(uri)?.use { input ->
+            InputStreamReader(input, Charsets.UTF_8).use { reader ->
+                val buffer = CharArray(4096)
+                val builder = StringBuilder()
+                while (builder.length < MAX_ATTACHMENT_TEXT_CHARS) {
+                    val read = reader.read(buffer, 0, minOf(buffer.size, MAX_ATTACHMENT_TEXT_CHARS - builder.length))
+                    if (read == -1) break
+                    builder.append(buffer, 0, read)
+                }
+                builder.toString()
+            }
+        } ?: error("无法读取附件")
 
     private fun showInstallScreen() {
         showScreen(Screen.INSTALL)
@@ -1752,6 +1840,30 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_IMAGE_PROMPT = 4
         private const val MENU_ADD_MODEL = 5
         private const val MENU_OPENAI_MODEL = 6
+        private const val MENU_ATTACH_TEXT = 20
+        private const val MENU_ATTACH_IMAGE = 21
+        private const val MENU_ATTACH_FILE = 22
+        private const val MAX_ATTACHMENT_TEXT_CHARS = 16000
+        private val TEXT_ATTACHMENT_EXTENSIONS = setOf(
+            ".txt",
+            ".md",
+            ".json",
+            ".csv",
+            ".xml",
+            ".html",
+            ".kt",
+            ".java",
+            ".py",
+            ".js",
+            ".ts",
+            ".css",
+            ".c",
+            ".cpp",
+            ".h",
+            ".log",
+            ".yaml",
+            ".yml"
+        )
     }
 }
 

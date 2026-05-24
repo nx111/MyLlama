@@ -6,6 +6,7 @@
     <string name="no_session_history">无会话历史</string>
     <string name="new_chat_symbol">+</string>
     <string name="circled_plus">⊕</string>
+    <string name="add_attachment">添加附件</string>
     <string name="add_model">添加模型</string>
     <string name="model_list">模型列表</string>
     <string name="installed_models">已安装模型</string>
