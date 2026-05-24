@@ -420,6 +420,16 @@ class MainActivity : AppCompatActivity() {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = 12.dp().toFloat()
             setColor(themeColor(com.google.android.material.R.attr.colorSurface))
+            val borderColor = themeTextColor(android.R.attr.textColorSecondary)
+            setStroke(
+                1.dp(),
+                Color.argb(
+                    96,
+                    Color.red(borderColor),
+                    Color.green(borderColor),
+                    Color.blue(borderColor)
+                )
+            )
         }
 
     private fun themeColor(attr: Int): Int {
