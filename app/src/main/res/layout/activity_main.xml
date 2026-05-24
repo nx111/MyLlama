@@ -23,13 +23,15 @@
             style="@style/Widget.Material3.Button.TextButton"
             android:layout_width="56dp"
             android:layout_height="48dp"
-            android:contentDescription="@string/settings"
+            android:contentDescription="@string/app_menu"
             android:minWidth="56dp"
             android:padding="0dp"
             android:text=""
-            app:icon="@drawable/outline_settings_24"
+            app:icon="@drawable/app_menu_icon"
             app:iconGravity="textStart"
-            app:iconPadding="0dp" />
+            app:iconSize="32dp"
+            app:iconPadding="0dp"
+            app:iconTint="@null" />
 
         <TextView
             android:id="@+id/app_title"

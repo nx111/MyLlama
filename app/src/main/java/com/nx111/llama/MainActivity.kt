@@ -5,6 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,13 +15,19 @@ import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.InputType
+import android.text.TextUtils
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.PopupWindow
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -94,6 +103,7 @@ class MainActivity : AppCompatActivity() {
     private var isModelReady = false
     private var currentModelLabel: String? = null
     private var currentAgentMode = AgentMode.CHAT
+    private var currentSessionId = UUID.randomUUID().toString()
     private var didLoadHubModels = false
     private var didTryAutoLoadLocalModel = false
     private var hubPage = 1
@@ -182,10 +192,10 @@ class MainActivity : AppCompatActivity() {
         currentAgentMode = appSettings.agentMode
         bindViews()
         setupLists()
-        loadMessages()
+        migrateLegacyMessages()
+        startEmptySession(appSettings.agentMode, persistPrevious = false)
         refreshInstalledModels()
         wireActions()
-        updateConversationMode()
         showScreen(Screen.USE)
         setBusy(true, "引擎初始化中...")
 
@@ -250,7 +260,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun wireActions() {
-        settingsBtn.setOnClickListener { showSettingsDialog() }
+        settingsBtn.setOnClickListener { showAppMenu() }
         newChatBtn.setOnClickListener { startConversation(currentAgentMode) }
         modelStatusTv.setOnClickListener { showCurrentModelPicker() }
         conversationPlusBtn.setOnClickListener { showConversationMenu() }
@@ -320,7 +330,121 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showAppMenu() {
+        saveMessages()
+        val sessionItems = loadSessions()
+        val menuWidth = minOf(resources.displayMetrics.widthPixels - 48.dp(), 320.dp())
+        val sessionRowCount = sessionItems.size.coerceAtLeast(1)
+        val menuHeight = minOf(48.dp() + 1 + sessionRowCount * 48.dp(), 420.dp())
+        lateinit var popup: PopupWindow
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = appMenuBackground()
+            addView(appMenuRow(getString(R.string.settings), enabled = true).apply {
+                setOnClickListener {
+                    popup.dismiss()
+                    showSettingsDialog()
+                }
+            })
+            addView(appMenuDivider())
+            if (sessionItems.isEmpty()) {
+                addView(appMenuRow(getString(R.string.no_session_history), enabled = false))
+            } else {
+                sessionItems.forEach { session ->
+                    addView(appMenuRow(session.title, enabled = true).apply {
+                        setOnClickListener {
+                            popup.dismiss()
+                            loadSession(session)
+                        }
+                        setOnLongClickListener {
+                            popup.dismiss()
+                            confirmDeleteSession(session)
+                            true
+                        }
+                    })
+                }
+            }
+        }
+        val scrollView = ScrollView(this).apply {
+            isFillViewport = false
+            addView(content)
+        }
+        popup = PopupWindow(scrollView, menuWidth, menuHeight, true).apply {
+            isOutsideTouchable = true
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                elevation = 8.dp().toFloat()
+            }
+        }
+        popup.showAsDropDown(settingsBtn, 0, 4.dp())
+    }
+
+    private fun confirmDeleteSession(session: ConversationSession) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("删除会话")
+            .setMessage("确定删除“${session.title}”？")
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton("删除") { _, _ -> deleteSession(session) }
+            .show()
+    }
+
+    private fun deleteSession(session: ConversationSession) {
+        writeSessions(loadSessions().filterNot { it.id == session.id })
+        if (session.id == currentSessionId) {
+            startEmptySession(currentAgentMode, persistPrevious = false)
+        }
+        Toast.makeText(this, "会话已删除", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun appMenuRow(text: String, enabled: Boolean): TextView =
+        TextView(this).apply {
+            this.text = text
+            ellipsize = TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER_VERTICAL
+            isEnabled = enabled
+            maxLines = 1
+            minHeight = 48.dp()
+            setPadding(20.dp(), 0, 20.dp(), 0)
+            setTextColor(themeTextColor(if (enabled) android.R.attr.textColorPrimary else android.R.attr.textColorSecondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        }
+
+    private fun appMenuDivider(): View =
+        View(this).apply {
+            setBackgroundColor(themeTextColor(android.R.attr.textColorSecondary))
+            alpha = 0.22f
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+        }
+
+    private fun appMenuBackground(): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 12.dp().toFloat()
+            setColor(themeColor(com.google.android.material.R.attr.colorSurface))
+        }
+
+    private fun themeColor(attr: Int): Int {
+        val value = TypedValue()
+        theme.resolveAttribute(attr, value, true)
+        return if (value.resourceId != 0) ContextCompat.getColor(this, value.resourceId) else value.data
+    }
+
+    private fun themeTextColor(attr: Int): Int {
+        val typedArray = theme.obtainStyledAttributes(intArrayOf(attr))
+        return try {
+            typedArray.getColor(0, themeColor(android.R.attr.textColorPrimary))
+        } finally {
+            typedArray.recycle()
+        }
+    }
+
     private fun startConversation(mode: AgentMode) {
+        startEmptySession(mode, persistPrevious = true)
+    }
+
+    private fun startEmptySession(mode: AgentMode, persistPrevious: Boolean) {
+        if (persistPrevious) saveMessages()
+        currentSessionId = UUID.randomUUID().toString()
         currentAgentMode = mode
         appSettings = appSettings.copy(agentMode = mode)
         messages.clear()
@@ -1106,34 +1230,127 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadMessages() {
-        messages.clear()
-        runCatching {
-            val array = JSONArray(prefs().getString(KEY_MESSAGES, "[]"))
-            for (index in 0 until array.length()) {
-                val item = array.getJSONObject(index)
-                messages.add(
-                    Message(
-                        id = item.optString("id", UUID.randomUUID().toString()),
-                        content = item.optString("content"),
-                        isUser = item.optBoolean("isUser")
-                    )
+    private fun migrateLegacyMessages() {
+        val raw = prefs().getString(KEY_MESSAGES, null) ?: return
+        val legacyMessages = runCatching { messagesFromJson(JSONArray(raw)) }.getOrDefault(emptyList())
+        if (legacyMessages.isNotEmpty()) {
+            val sessions = loadSessions()
+            sessions.add(
+                0,
+                ConversationSession(
+                    id = UUID.randomUUID().toString(),
+                    title = buildSessionTitle(legacyMessages, appSettings.agentMode),
+                    updatedAt = System.currentTimeMillis(),
+                    mode = appSettings.agentMode,
+                    messages = legacyMessages
                 )
-            }
+            )
+            writeSessions(sessions)
         }
+        prefs().edit().remove(KEY_MESSAGES).apply()
+    }
+
+    private fun loadSession(session: ConversationSession) {
+        saveMessages()
+        currentSessionId = session.id
+        currentAgentMode = session.mode
+        appSettings = appSettings.copy(agentMode = session.mode)
+        messages.clear()
+        messages.addAll(session.messages)
+        lastAssistantMsg.clear()
         messageAdapter.notifyDataSetChanged()
         if (messages.isNotEmpty()) messagesRv.scrollToPosition(messages.lastIndex)
+        updateConversationMode()
+        showScreen(Screen.USE)
+        saveAppSettings()
+        refreshControls()
     }
 
     private fun saveMessages() {
+        if (messages.isEmpty()) return
+        val sessions = loadSessions()
+            .filterNot { it.id == currentSessionId }
+            .toMutableList()
+        sessions.add(
+            0,
+            ConversationSession(
+                id = currentSessionId,
+                title = buildSessionTitle(messages, currentAgentMode),
+                updatedAt = System.currentTimeMillis(),
+                mode = currentAgentMode,
+                messages = messages.toList()
+            )
+        )
+        writeSessions(sessions)
+    }
+
+    private fun loadSessions(): MutableList<ConversationSession> =
+        runCatching {
+            val raw = prefs().getString(KEY_SESSIONS, "[]") ?: "[]"
+            sessionsFromJson(JSONArray(raw))
+        }.getOrDefault(mutableListOf())
+
+    private fun writeSessions(sessions: List<ConversationSession>) {
         prefs().edit()
-            .putString(KEY_MESSAGES, messagesToJson().toString())
+            .putString(KEY_SESSIONS, sessionsToJson(sessions).toString())
             .apply()
     }
 
-    private fun messagesToJson(): JSONArray {
+    private fun sessionsFromJson(array: JSONArray): MutableList<ConversationSession> {
+        val sessions = mutableListOf<ConversationSession>()
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val modeName = item.optString("mode", AgentMode.CHAT.name)
+            val mode = AgentMode.values().firstOrNull { it.name == modeName } ?: AgentMode.CHAT
+            val sessionMessages = messagesFromJson(item.optJSONArray("messages"))
+            if (sessionMessages.isEmpty()) continue
+            sessions.add(
+                ConversationSession(
+                    id = item.optString("id", UUID.randomUUID().toString()),
+                    title = item.optString("title").ifBlank { buildSessionTitle(sessionMessages, mode) },
+                    updatedAt = item.optLong("updatedAt", 0L),
+                    mode = mode,
+                    messages = sessionMessages
+                )
+            )
+        }
+        return sessions.sortedByDescending { it.updatedAt }.toMutableList()
+    }
+
+    private fun sessionsToJson(sessions: List<ConversationSession>): JSONArray {
         val array = JSONArray()
-        messages.forEach { message ->
+        sessions.forEach { session ->
+            array.put(
+                JSONObject()
+                    .put("id", session.id)
+                    .put("title", session.title)
+                    .put("updatedAt", session.updatedAt)
+                    .put("mode", session.mode.name)
+                    .put("messages", messagesToJson(session.messages))
+            )
+        }
+        return array
+    }
+
+    private fun messagesFromJson(array: JSONArray?): List<Message> {
+        val result = mutableListOf<Message>()
+        if (array == null) return result
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            result.add(
+                Message(
+                    id = item.optString("id", UUID.randomUUID().toString()),
+                    content = item.optString("content"),
+                    isUser = item.optBoolean("isUser")
+                )
+            )
+        }
+        return result
+    }
+
+    private fun messagesToJson(source: List<Message> = messages): JSONArray {
+        val array = JSONArray()
+        source.forEach { message ->
             array.put(
                 JSONObject()
                     .put("id", message.id)
@@ -1142,6 +1359,14 @@ class MainActivity : AppCompatActivity() {
             )
         }
         return array
+    }
+
+    private fun buildSessionTitle(source: List<Message>, mode: AgentMode): String {
+        val firstUserMessage = source.firstOrNull { it.isUser }?.content.orEmpty()
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        val title = firstUserMessage.ifBlank { mode.label }
+        return if (title.length > 30) "${title.take(30)}..." else title
     }
 
     private fun loadAppSettings(): AppSettings {
@@ -1194,6 +1419,7 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject()
                     .put("version", 1)
                     .put("settings", appSettings.toJson())
+                    .put("sessions", sessionsToJson(loadSessions()))
                     .put("messages", messagesToJson())
                     .toString(2)
                 withContext(Dispatchers.IO) {
@@ -1227,26 +1453,37 @@ class MainActivity : AppCompatActivity() {
                         else -> currentModelLabel
                     }
 
-                messages.clear()
-                val restoredMessages = json.optJSONArray("messages") ?: JSONArray()
-                for (index in 0 until restoredMessages.length()) {
-                    val item = restoredMessages.getJSONObject(index)
-                    messages.add(
-                        Message(
-                            id = item.optString("id", UUID.randomUUID().toString()),
-                            content = item.optString("content"),
-                            isUser = item.optBoolean("isUser")
+                val restoredSessions = json.optJSONArray("sessions")
+                if (restoredSessions != null) {
+                    writeSessions(sessionsFromJson(restoredSessions))
+                } else {
+                    val restoredMessages = messagesFromJson(json.optJSONArray("messages"))
+                    if (restoredMessages.isNotEmpty()) {
+                        writeSessions(
+                            listOf(
+                                ConversationSession(
+                                    id = UUID.randomUUID().toString(),
+                                    title = buildSessionTitle(restoredMessages, currentAgentMode),
+                                    updatedAt = System.currentTimeMillis(),
+                                    mode = currentAgentMode,
+                                    messages = restoredMessages
+                                )
+                            )
                         )
-                    )
+                    } else {
+                        writeSessions(emptyList())
+                    }
                 }
 
                 saveAppSettings()
-                saveMessages()
+                currentSessionId = UUID.randomUUID().toString()
+                messages.clear()
+                lastAssistantMsg.clear()
                 didLoadHubModels = false
                 didTryAutoLoadLocalModel = false
                 hubModelAdapter.submitList(emptyList())
             }.onSuccess {
-                updateConversationMode()
+                startEmptySession(appSettings.agentMode, persistPrevious = false)
                 messageAdapter.notifyDataSetChanged()
                 refreshInstalledModels()
                 showScreen(Screen.USE)
@@ -1379,6 +1616,14 @@ class MainActivity : AppCompatActivity() {
         OPENAI_COMPATIBLE("OpenAI 兼容")
     }
 
+    private data class ConversationSession(
+        val id: String,
+        val title: String,
+        val updatedAt: Long,
+        val mode: AgentMode,
+        val messages: List<Message>
+    )
+
     private enum class EngineChoice(val label: String, val backend: EngineBackend) {
         CPU("CPU", EngineBackend.CPU),
         GPU("GPU", EngineBackend.GPU)
@@ -1470,6 +1715,7 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
         private const val PREFS_NAME = "myllama_state"
         private const val KEY_MESSAGES = "messages"
+        private const val KEY_SESSIONS = "sessions"
         private const val KEY_MODEL_PROVIDER = "modelProvider"
         private const val KEY_MODEL_STORAGE_PATH = "modelStoragePath"
         private const val KEY_HF_BASE_URL = "huggingFaceBaseUrl"

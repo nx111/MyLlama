@@ -1,7 +1,9 @@
 <resources>
     <string name="app_name">MyLlama</string>
     <string name="model_status_initial">未加载模型</string>
+    <string name="app_menu">应用菜单</string>
     <string name="settings">设置</string>
+    <string name="no_session_history">无会话历史</string>
     <string name="new_chat_symbol">+</string>
     <string name="circled_plus">⊕</string>
     <string name="add_model">添加模型</string>
