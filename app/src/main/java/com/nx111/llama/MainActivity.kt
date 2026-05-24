@@ -320,7 +320,6 @@ class MainActivity : AppCompatActivity() {
             menu.add(0, MENU_TRANSLATION, 2, "新建翻译")
             menu.add(0, MENU_IMAGE_PROMPT, 3, "新建生图提示词")
             menu.add(0, MENU_ADD_MODEL, 4, "添加模型")
-            menu.add(0, MENU_OPENAI_MODEL, 5, "配置 OpenAI 兼容模型")
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_CHAT -> startConversation(AgentMode.CHAT)
@@ -328,7 +327,6 @@ class MainActivity : AppCompatActivity() {
                     MENU_TRANSLATION -> startConversation(AgentMode.TRANSLATION)
                     MENU_IMAGE_PROMPT -> startConversation(AgentMode.IMAGE_PROMPT)
                     MENU_ADD_MODEL -> showInstallScreen()
-                    MENU_OPENAI_MODEL -> showOpenAiModelDialog()
                 }
                 true
             }
@@ -1839,7 +1837,6 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_TRANSLATION = 3
         private const val MENU_IMAGE_PROMPT = 4
         private const val MENU_ADD_MODEL = 5
-        private const val MENU_OPENAI_MODEL = 6
         private const val MENU_ATTACH_TEXT = 20
         private const val MENU_ATTACH_IMAGE = 21
         private const val MENU_ATTACH_FILE = 22
