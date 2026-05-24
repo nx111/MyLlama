@@ -105,7 +105,6 @@ class MainActivity : AppCompatActivity() {
     private var currentAgentMode = AgentMode.CHAT
     private var currentSessionId = UUID.randomUUID().toString()
     private var didLoadHubModels = false
-    private var didTryAutoLoadLocalModel = false
     private var hubPage = 1
     private var hubSort = HuggingFaceSort.HOT
     private var hubQuery: String? = null
@@ -610,49 +609,50 @@ class MainActivity : AppCompatActivity() {
         resetAndLoadHubModels(HuggingFaceSort.HOT, null)
     }
 
-    private fun autoLoadLocalModelOnce() {
-        if (didTryAutoLoadLocalModel) return
-        if (appSettings.modelProvider != ModelProvider.LOCAL) return
-
-        didTryAutoLoadLocalModel = true
+    private fun loadLocalModelForChat(userMsg: String) {
         lifecycleScope.launch {
             runCatching {
                 val savedFile = savedLocalModelFile()
                 val savedModel = savedFile?.takeIf { it.isFile && it.canRead() }
                 if (savedModel != null) {
-                    setBusy(true, "正在加载上次使用的模型...")
+                    setBusy(true, "正在加载模型...")
                     loadModel(savedModel, persist = true)
-                    return@runCatching
+                    return@runCatching true
                 }
 
                 if (savedFile != null) {
                     currentModelLabel = null
                     appSettings = appSettings.copy(localModelPath = "")
                     saveAppSettings()
+                    modelStatusTv.text = statusLine(engine)
                 }
 
                 val installedModels = modelRepository.listInstalledModels(installedModelDirs())
                 when (installedModels.size) {
                     0 -> {
-                        modelStatusTv.text = if (savedFile == null) "未加载模型" else "上次使用的模型不存在，请添加模型"
-                        refreshControls()
+                        Toast.makeText(this@MainActivity, "请先添加模型", Toast.LENGTH_SHORT).show()
+                        false
                     }
                     1 -> {
-                        setBusy(true, if (savedFile == null) "正在加载模型..." else "上次使用的模型不存在，正在加载可用模型...")
+                        setBusy(true, "正在加载模型...")
                         loadModel(installedModels.first().file, persist = true)
+                        true
                     }
                     else -> {
-                        val pickerTitle = if (savedFile == null) "选择模型" else "上次使用的模型不存在"
-                        modelStatusTv.text = pickerTitle
-                        refreshControls()
-                        showModelPicker(installedModels, pickerTitle)
+                        showModelPicker(installedModels, "选择模型") {
+                            submitUserMessage(userMsg)
+                        }
+                        false
                     }
                 }
+            }.onSuccess { loaded ->
+                if (loaded) submitUserMessage(userMsg)
             }.onFailure { showError(it) }
+            refreshControls()
         }
     }
 
-    private fun showModelPicker(models: List<InstalledModel>, title: String) {
+    private fun showModelPicker(models: List<InstalledModel>, title: String, onLoaded: (() -> Unit)? = null) {
         val items = models.map { model ->
             "${model.name}  ${model.sizeLabel}"
         }.toTypedArray()
@@ -664,6 +664,8 @@ class MainActivity : AppCompatActivity() {
                     runCatching {
                         setBusy(true, "正在加载选择的模型...")
                         loadModel(models[index].file, persist = true)
+                    }.onSuccess {
+                        onLoaded?.invoke()
                     }.onFailure { showError(it) }
                     refreshControls()
                 }
@@ -818,11 +820,19 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请输入内容", Toast.LENGTH_SHORT).show()
             return
         }
+        if (appSettings.modelProvider == ModelProvider.LOCAL && !isModelReady) {
+            loadLocalModelForChat(userMsg)
+            return
+        }
         if (!activeModelReady()) {
             Toast.makeText(this, "请先添加并加载模型", Toast.LENGTH_SHORT).show()
             return
         }
 
+        submitUserMessage(userMsg)
+    }
+
+    private fun submitUserMessage(userMsg: String) {
         userInputEt.text = null
         setBusy(true, "生成中...")
 
@@ -1111,7 +1121,6 @@ class MainActivity : AppCompatActivity() {
                     modelStoragePath = newDir.absolutePath,
                     localModelPath = updatedLocalModelPath(oldLocalPath, migratedModels)
                 )
-                didTryAutoLoadLocalModel = false
                 saveAppSettings()
                 refreshInstalledModels()
                 migratedModels.size
@@ -1480,7 +1489,6 @@ class MainActivity : AppCompatActivity() {
                 messages.clear()
                 lastAssistantMsg.clear()
                 didLoadHubModels = false
-                didTryAutoLoadLocalModel = false
                 hubModelAdapter.submitList(emptyList())
             }.onSuccess {
                 startEmptySession(appSettings.agentMode, persistPrevious = false)
@@ -1499,7 +1507,6 @@ class MainActivity : AppCompatActivity() {
             is InferenceEngine.State.Initialized -> {
                 isModelReady = false
                 setBusy(false, statusLine(engine))
-                autoLoadLocalModelOnce()
                 if (installScreen.visibility == View.VISIBLE) loadHubModelsOnce()
             }
             is InferenceEngine.State.ModelReady -> {
