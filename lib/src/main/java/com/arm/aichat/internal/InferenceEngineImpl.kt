@@ -237,6 +237,7 @@ internal class InferenceEngineImpl private constructor(
 
         try {
             Log.i(TAG, "Sending user prompt...")
+            _cancelGeneration = false
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
 
@@ -270,6 +271,10 @@ internal class InferenceEngineImpl private constructor(
             throw e
         }
     }.flowOn(llamaDispatcher)
+
+    override fun cancelGeneration() {
+        _cancelGeneration = true
+    }
 
     /**
      * Benchmark the model

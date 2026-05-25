@@ -1,6 +1,8 @@
 package com.nx111.llama
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.ActivityNotFoundException
@@ -51,6 +53,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
@@ -116,7 +119,9 @@ class MainActivity : AppCompatActivity() {
 
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
-    private val messageAdapter = MessageAdapter(messages)
+    private val messageAdapter = MessageAdapter(messages) { position ->
+        showMessageActions(position)
+    }
     private val installedModelAdapter = InstalledModelAdapter(
         onClick = { model -> loadInstalledModel(model) },
         onLongClick = { model -> showInstalledModelActions(model) }
@@ -182,7 +187,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         onBackPressedDispatcher.addCallback {
             when {
-                generationJob?.isActive == true -> generationJob?.cancel()
+                generationJob?.isActive == true -> stopGeneration()
                 installScreen.visibility == View.VISIBLE -> showScreen(Screen.USE)
                 else -> finish()
             }
@@ -296,7 +301,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
         importBtn.setOnClickListener { pickModel.launch(arrayOf("*/*")) }
-        userActionFab.setOnClickListener { handleUserInput() }
+        userActionFab.setOnClickListener {
+            if (generationJob?.isActive == true) {
+                stopGeneration()
+            } else {
+                handleUserInput()
+            }
+        }
         modelSourceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val source = AddModelSource.values()[position.coerceIn(0, AddModelSource.values().lastIndex)]
@@ -490,6 +501,73 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateConversationMode() {
         conversationModeTv.text = currentAgentMode.label
+    }
+
+    private fun showMessageActions(position: Int) {
+        if (position !in messages.indices) return
+        val message = messages[position]
+        MaterialAlertDialogBuilder(this)
+            .setItems(arrayOf("复制", "修改")) { _, index ->
+                when (index) {
+                    0 -> copyMessage(message)
+                    1 -> showEditMessageDialog(position)
+                }
+            }
+            .show()
+    }
+
+    private fun copyMessage(message: Message) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("message", message.content))
+        Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showEditMessageDialog(position: Int) {
+        if (generationJob?.isActive == true) {
+            Toast.makeText(this, "请先中断生成", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (position !in messages.indices) return
+        val editText = EditText(this).apply {
+            setText(messages[position].content)
+            setSelection(text?.length ?: 0)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            maxLines = 8
+            setPadding(16.dp(), 8.dp(), 16.dp(), 8.dp())
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("修改发言")
+            .setView(editText)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton("保存") { _, _ ->
+                val updatedContent = editText.text?.toString().orEmpty()
+                if (updatedContent.isBlank()) {
+                    Toast.makeText(this, "内容不能为空", Toast.LENGTH_SHORT).show()
+                } else {
+                    applyEditedMessage(position, updatedContent)
+                }
+            }
+            .show()
+    }
+
+    private fun applyEditedMessage(position: Int, updatedContent: String) {
+        if (position !in messages.indices) return
+        val original = messages[position]
+        messages[position] = original.copy(content = updatedContent)
+        messageAdapter.notifyItemChanged(position, MESSAGE_CONTENT_PAYLOAD)
+
+        val removeStart = position + 1
+        val removeCount = messages.size - removeStart
+        if (removeCount > 0) {
+            messages.subList(removeStart, messages.size).clear()
+            messageAdapter.notifyItemRangeRemoved(removeStart, removeCount)
+        }
+        lastAssistantMsg.clear()
+        saveMessages()
+        if (original.isUser) {
+            generateReplyForUserAt(position)
+        }
     }
 
     private fun attachFileToInput(uri: Uri) {
@@ -705,7 +783,7 @@ class MainActivity : AppCompatActivity() {
         resetAndLoadHubModels(HuggingFaceSort.HOT, null)
     }
 
-    private fun loadLocalModelForChat(userMsg: String) {
+    private fun loadLocalModelForChat(onReady: () -> Unit) {
         lifecycleScope.launch {
             runCatching {
                 val savedFile = savedLocalModelFile()
@@ -736,13 +814,13 @@ class MainActivity : AppCompatActivity() {
                     }
                     else -> {
                         showModelPicker(installedModels, "选择模型") {
-                            submitUserMessage(userMsg)
+                            onReady()
                         }
                         false
                     }
                 }
             }.onSuccess { loaded ->
-                if (loaded) submitUserMessage(userMsg)
+                if (loaded) onReady()
             }.onFailure { showError(it) }
             refreshControls()
         }
@@ -917,7 +995,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (appSettings.modelProvider == ModelProvider.LOCAL && !isModelReady) {
-            loadLocalModelForChat(userMsg)
+            loadLocalModelForChat { submitUserMessage(userMsg) }
             return
         }
         if (!activeModelReady()) {
@@ -930,20 +1008,37 @@ class MainActivity : AppCompatActivity() {
 
     private fun submitUserMessage(userMsg: String) {
         userInputEt.text = null
-        setBusy(true, "生成中...")
-
-        val prompt = currentAgentMode.prompt(userMsg)
         val firstInsertedIndex = messages.size
         messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
+        messageAdapter.notifyItemInserted(firstInsertedIndex)
+        messagesRv.scrollToPosition(messages.lastIndex)
+        generateReplyForUserAt(firstInsertedIndex)
+    }
+
+    private fun generateReplyForUserAt(userIndex: Int) {
+        if (userIndex !in messages.indices || !messages[userIndex].isUser) return
+        if (appSettings.modelProvider == ModelProvider.LOCAL && !isModelReady) {
+            loadLocalModelForChat { generateReplyForUserAt(userIndex) }
+            return
+        }
+        if (!activeModelReady()) {
+            Toast.makeText(this, "请先添加并加载模型", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        setBusy(true, "生成中...")
+
+        val userMsg = messages[userIndex].content
+        val prompt = currentAgentMode.prompt(userMsg)
+        val history = messages.take(userIndex)
+        val assistantInsertedIndex = messages.size
         lastAssistantMsg.clear()
         messages.add(Message(UUID.randomUUID().toString(), "", false))
         shouldAutoScrollAssistant = true
-        messageAdapter.notifyItemRangeInserted(firstInsertedIndex, 2)
+        messageAdapter.notifyItemInserted(assistantInsertedIndex)
         messagesRv.scrollToPosition(messages.lastIndex)
-
-        val history = messages.dropLast(2)
         if (appSettings.modelProvider == ModelProvider.OPENAI_COMPATIBLE) {
-            generationJob = lifecycleScope.launch {
+            trackGenerationJob(lifecycleScope.launch {
                 runCatching {
                     openAiClient.complete(
                         baseUrl = appSettings.openAiBaseUrl,
@@ -955,24 +1050,20 @@ class MainActivity : AppCompatActivity() {
                     )
                 }.onSuccess { reply ->
                     appendAssistantToken(reply)
-                    flushAssistantMessage()
-                    saveMessages()
+                    finishGeneration()
                 }.onFailure { error ->
-                    flushAssistantMessage()
-                    showError(error)
-                    saveMessages()
+                    handleGenerationFailure(error)
                 }
                 refreshControls()
-            }
+            })
         } else {
             val activeEngine = engine ?: return
-            generationJob = lifecycleScope.launch(Dispatchers.Default) {
+            trackGenerationJob(lifecycleScope.launch(Dispatchers.Default) {
                 runCatching {
                     activeEngine.sendUserPrompt(prompt, appSettings.predictLength)
                         .onCompletion {
                             withContext(Dispatchers.Main) {
-                                flushAssistantMessage()
-                                saveMessages()
+                                finishGeneration()
                                 refreshControls()
                             }
                         }
@@ -981,14 +1072,52 @@ class MainActivity : AppCompatActivity() {
                         }
                 }.onFailure { error ->
                     withContext(Dispatchers.Main) {
-                        flushAssistantMessage()
-                        showError(error)
-                        saveMessages()
+                        handleGenerationFailure(error)
                         refreshControls()
                     }
                 }
-            }
+            })
         }
+    }
+
+    private fun trackGenerationJob(job: Job) {
+        generationJob = job
+        refreshControls()
+        job.invokeOnCompletion {
+            lifecycleScope.launch { refreshControls() }
+        }
+    }
+
+    private fun finishGeneration() {
+        flushAssistantMessage()
+        removeEmptyTrailingAssistant()
+        saveMessages()
+        isBusy = false
+        modelStatusTv.text = statusLine(engine)
+    }
+
+    private fun removeEmptyTrailingAssistant() {
+        val index = messages.lastIndex
+        if (index >= 0 && !messages[index].isUser && messages[index].content.isBlank()) {
+            messages.removeAt(index)
+            messageAdapter.notifyItemRemoved(index)
+        }
+    }
+
+    private fun handleGenerationFailure(error: Throwable) {
+        finishGeneration()
+        if (error !is CancellationException) {
+            showError(error)
+        }
+    }
+
+    private fun stopGeneration() {
+        val activeJob = generationJob ?: return
+        if (!activeJob.isActive) return
+        engine?.cancelGeneration()
+        activeJob.cancel()
+        finishGeneration()
+        refreshControls()
     }
 
     private fun activeModelReady(): Boolean =
@@ -1636,6 +1765,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshControls() {
         val engineReady = engine != null
+        val isGenerating = generationJob?.isActive == true
         val canInstall = engineReady && !isBusy
         settingsBtn.isEnabled = !isBusy
         newChatBtn.isEnabled = !isBusy
@@ -1655,7 +1785,9 @@ class MainActivity : AppCompatActivity() {
         hubModelsRv.isEnabled = canInstall
         installedModelsRv.isEnabled = canInstall
         userInputEt.isEnabled = canInstall
-        userActionFab.isEnabled = canInstall
+        userActionFab.isEnabled = canInstall || isGenerating
+        userActionFab.setImageResource(if (isGenerating) R.drawable.outline_stop_24 else R.drawable.outline_send_24)
+        userActionFab.contentDescription = getString(if (isGenerating) R.string.stop_generation else R.string.send_message)
     }
 
     private fun statusLine(_activeEngine: InferenceEngine?): String {
@@ -1674,6 +1806,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        if (generationJob?.isActive == true) engine?.cancelGeneration()
         generationJob?.cancel()
         saveMessages()
         saveAppSettings()
