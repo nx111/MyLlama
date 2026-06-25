@@ -90,6 +90,10 @@ static std::pair<httplib::Client, common_http_url> common_http_client(const std:
     }
 
     cli.set_follow_location(true);
+    cli.set_connection_timeout(10);
+    cli.set_read_timeout(30, 0);
+    cli.set_write_timeout(30, 0);
+    cli.set_keep_alive(true);
 
     return { std::move(cli), std::move(parts) };
 }

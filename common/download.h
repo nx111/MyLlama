@@ -12,6 +12,7 @@ struct common_download_progress {
     std::string url;
     size_t downloaded = 0;
     size_t total      = 0;
+    double speed_mbps = 0.0;
     bool cached       = false;
 };
 

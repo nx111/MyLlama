@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <iomanip>
+#include <random>
 #include <fstream>
 #include <future>
 #include <map>
@@ -191,7 +193,12 @@ public:
         for (size_t i = 0; i < bar; i += 2) {
             std::cout << (i + 1 < pos ? "─" : (i < pos ? "╴" : " "));
         }
-        std::cout << std::setw(4) << pct << "%\033[K";
+        std::cout << std::setw(4) << pct << "%";
+
+        if (p.speed_mbps > 0.0) {
+            std::cout << " " << std::fixed << std::setprecision(1) << p.speed_mbps << " MB/s";
+        }
+        std::cout << "\033[K";
 
         if (lines_up > 0) {
             std::cout << "\033[" << lines_up << "B";
@@ -226,11 +233,28 @@ static bool common_pull_file(httplib::Client & cli,
 
     const char * func = __func__; // avoid __func__ inside a lambda
     size_t progress_step = 0;
+    size_t stall_bytes   = 0;
+    size_t report_bytes  = p.downloaded;
+    auto   last_report   = std::chrono::steady_clock::now();
+
+    cli.set_read_timeout(30, 0);
 
     auto res = cli.Get(resolve_path, headers,
         [&](const httplib::Response &response) {
             if (p.downloaded > 0 && response.status != 206) {
                 LOG_WRN("%s: server did not respond with 206 Partial Content for a resume request. Status: %d\n", func, response.status);
+                // If server returned 200 OK and we have partial data, restart from zero
+                if (response.status == 200) {
+                    LOG_WRN("%s: server does not support range requests, restarting download\n", func);
+                    p.downloaded = 0;
+                    ofs.close();
+                    ofs.open(path_tmp, std::ios::binary | std::ios::trunc);
+                    if (!ofs.is_open()) {
+                        LOG_ERR("%s: error re-opening file for writing: %s\n", func, path_tmp.c_str());
+                        return false;
+                    }
+                    return true; // continue with full download
+                }
                 return false;
             }
             if (p.downloaded == 0 && response.status != 200) {
@@ -255,14 +279,33 @@ static bool common_pull_file(httplib::Client & cli,
             }
             p.downloaded += len;
             progress_step += len;
+            stall_bytes   += len;
+
+            // detect stalled connection (no data received for >60s)
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count();
+            if (stall_bytes > 0 && elapsed >= 30) {
+                LOG_WRN("%s: download appears stalled (%zu bytes in %ld seconds), aborting\n",
+                        func, stall_bytes, elapsed);
+                return false;
+            }
 
             if (progress_step >= p.total / 1000 || p.downloaded == p.total) {
                 if (callback) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_report).count();
+                    if (elapsed > 0) {
+                        size_t bytes_since_report = p.downloaded - report_bytes;
+                        p.speed_mbps = (bytes_since_report / elapsed) / (1024.0 * 1024.0);
+                    }
+                    report_bytes = p.downloaded;
                     callback->on_update(p);
                     if (callback->is_cancelled()) {
                         return false;
                     }
+                    last_report = now;
                 }
+                stall_bytes = 0;
                 progress_step = 0;
             }
             return true;
@@ -287,8 +330,8 @@ static int common_download_file_single_online(const std::string & url,
                                               const std::string & path,
                                               const common_download_opts & opts,
                                               bool skip_etag) {
-    static const int max_attempts        = 3;
-    static const int retry_delay_seconds = 2;
+    static const int max_attempts        = 5;
+    static const int retry_delay_seconds = 3;
 
     const bool file_exists = std::filesystem::exists(path);
 
@@ -379,6 +422,7 @@ static int common_download_file_single_online(const std::string & url,
     bool success = false;
     const std::string path_temporary = path + ".downloadInProgress";
     int delay = retry_delay_seconds;
+    static std::mt19937 rng(std::random_device{}());
 
     if (opts.callback) {
         opts.callback->on_start(p);
@@ -389,9 +433,13 @@ static int common_download_file_single_online(const std::string & url,
             break;
         }
         if (i) {
-            LOG_WRN("%s: retrying after %d seconds...\n", __func__, delay);
-            std::this_thread::sleep_for(std::chrono::seconds(delay));
-            delay *= retry_delay_seconds;
+            // jitter: +/- 33% of delay
+            int jitter_range = std::max(1, delay / 3);
+            std::uniform_int_distribution<int> dist(-jitter_range, jitter_range);
+            int actual_delay = std::max(1, delay + dist(rng));
+            LOG_WRN("%s: retry %d/%d after %d seconds...\n", __func__, i, max_attempts, actual_delay);
+            std::this_thread::sleep_for(std::chrono::seconds(actual_delay));
+            delay = std::min(delay * retry_delay_seconds, 120);
         }
 
         size_t existing_size = 0;
