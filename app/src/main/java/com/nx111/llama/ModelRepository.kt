@@ -9,9 +9,12 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
+import kotlin.random.Random
 
 class ModelRepository(private val context: Context) {
     private val contentResolver: ContentResolver = context.contentResolver
@@ -124,47 +127,108 @@ class ModelRepository(private val context: Context) {
         require(repo.isNotBlank()) { "Hugging Face repo is required" }
         require(filename.isNotBlank()) { "GGUF filename is required" }
 
-        val target = File(targetDir.ensureModelDirectory(), filename.substringAfterLast('/').sanitizeFileName().ensureGgufExtension())
-        val connection = URL(huggingFaceResolveUrl(baseUrl, repo, filename)).openConnection() as HttpURLConnection
-        connection.instanceFollowRedirects = true
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 60_000
-        connection.setRequestProperty("User-Agent", "MyLlama-Android")
-        if (!token.isNullOrBlank()) {
-            connection.setRequestProperty("Authorization", "Bearer ${token.trim()}")
-        }
+        val targetName = filename.substringAfterLast('/').sanitizeFileName().ensureGgufExtension()
+        val targetDirResolved = targetDir.ensureModelDirectory()
+        val target = File(targetDirResolved, targetName)
+        val tmpPath = File(targetDirResolved, "$targetName.downloadInProgress")
+        val downloadUrl = huggingFaceResolveUrl(baseUrl, repo, filename)
 
-        try {
-            val code = connection.responseCode
-            if (code !in 200..299) {
-                val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                error("Hugging Face download failed: HTTP $code $errorText")
+        val maxAttempts = 5
+        var delay = 3
+        var lastError: Exception? = null
+
+        for (attempt in 0 until maxAttempts) {
+            if (attempt > 0) {
+                val jitterRange = (delay / 3).coerceAtLeast(1)
+                val actualDelay = (delay + Random.nextInt(-jitterRange, jitterRange + 1)).coerceAtLeast(1)
+                delay = (delay * 3).coerceAtMost(120)
+                Thread.sleep(actualDelay * 1000L)
             }
 
-            val contentLength = connection.contentLengthLong
-            var copied = 0L
-            connection.inputStream.use { input ->
-                FileOutputStream(target).use { output ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        copied += read
-                        if (contentLength > 0) {
-                            onProgress(((copied * 100) / contentLength).toInt().coerceIn(0, 100))
+            val downloaded = if (tmpPath.exists()) tmpPath.length() else 0L
+            val connection = URL(downloadUrl).openConnection() as HttpURLConnection
+            connection.instanceFollowRedirects = true
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 300_000
+            connection.setRequestProperty("User-Agent", "MyLlama-Android")
+            if (!token.isNullOrBlank()) {
+                connection.setRequestProperty("Authorization", "Bearer ${token.trim()}")
+            }
+            if (downloaded > 0) {
+                connection.setRequestProperty("Range", "bytes=$downloaded-")
+            }
+
+            try {
+                val code = connection.responseCode
+                if (downloaded > 0) {
+                    if (code == 206) {
+                        // Partial content - resume ok
+                    } else if (code == 200) {
+                        // Server doesn't support ranges, restart
+                        tmpPath.delete()
+                        continue
+                    } else {
+                        val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                        error("Hugging Face download failed: HTTP $code $errorText")
+                    }
+                } else {
+                    if (code !in 200..299) {
+                        val errorText = connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                        error("Hugging Face download failed: HTTP $code $errorText")
+                    }
+                }
+
+                val remainingLength = connection.contentLengthLong
+                val totalLength = if (remainingLength > 0 && downloaded > 0) downloaded + remainingLength else remainingLength
+                var copied = downloaded
+                var stallBytes = 0L
+                var lastProgress = System.nanoTime()
+
+                connection.inputStream.use { input ->
+                    FileOutputStream(tmpPath, true).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            copied += read
+                            stallBytes += read
+
+                            val now = System.nanoTime()
+                            val elapsed = (now - lastProgress) / 1_000_000_000L
+                            if (stallBytes > 0 && elapsed >= 30) {
+                                throw SocketTimeoutException("Download stalled (no data for ${elapsed}s)")
+                            }
+
+                            if (totalLength > 0) {
+                                val pct = ((copied * 100) / totalLength).toInt().coerceIn(0, 100)
+                                onProgress(pct)
+                                lastProgress = now
+                                stallBytes = 0
+                            }
                         }
                     }
                 }
+
+                if (tmpPath.renameTo(target)) {
+                    onProgress(100)
+                    return@withContext target
+                }
+                error("Failed to rename downloaded file")
+            } catch (e: Exception) {
+                lastError = e
+                if (e is IOException && attempt < maxAttempts - 1) {
+                    // Transient error, retry
+                    continue
+                }
+                throw e
+            } finally {
+                connection.disconnect()
             }
-            onProgress(100)
-            target
-        } catch (e: Exception) {
-            target.delete()
-            throw e
-        } finally {
-            connection.disconnect()
         }
+
+        tmpPath.delete()
+        throw lastError ?: IOException("Download failed after $maxAttempts attempts")
     }
 
     suspend fun listHuggingFaceModels(
